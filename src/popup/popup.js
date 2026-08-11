@@ -36,6 +36,9 @@ const state = {
   pageUrl: '',
   tabId: null,
   scroll: null,
+  // How much of the page the collector actually inspected. null until the first
+  // scan comes back.
+  coverage: null,
   download: blankProgress(),
   downloadResult: null,
   // Every progress payload received and every bar width actually painted, in order.
@@ -63,6 +66,7 @@ Object.defineProperty(window, '__DIAG__', {
         downloadRequested: state.downloadRequested,
         downloadIds: state.downloadIds.slice(),
         scroll: state.scroll,
+        coverage: state.coverage,
         download: { ...state.download },
         downloadResult: state.downloadResult,
         progressEvents: state.progressEvents.slice(),
@@ -262,6 +266,24 @@ function renderScrollNote() {
     : `${moved} \u00b7 END NOT CONFIRMED (${summary.outcome}) \u2013 there may be more below`;
 }
 
+// The other half of the same idea, one layer earlier: the scroll may have reached
+// the bottom and the collector still only looked at part of the DOM. Shown ONLY
+// when the scan was truncated - a complete scan is the normal case and does not
+// need a banner saying so.
+function renderScanNote() {
+  const note = byId('scanNote');
+  const coverage = state.coverage;
+  if (!coverage || coverage.complete !== false) {
+    note.hidden = true;
+    note.textContent = '';
+    note.classList.remove('warn');
+    return;
+  }
+  note.hidden = false;
+  note.classList.add('warn');
+  note.textContent = coverage.warning;
+}
+
 function render() {
   state.visible = applyFilters(state.all, state.settings);
   const visibleUrls = new Set(state.visible.map(item => item.url));
@@ -368,8 +390,10 @@ async function rescan() {
   state.pageUrl = response.data.pageUrl;
   state.rawCandidates = response.data.candidates.length;
   state.scroll = response.data.scroll || null;
+  state.coverage = response.data.coverage || null;
   state.all = normalizeCandidates(response.data.candidates, response.data.pageUrl);
   renderScrollNote();
+  renderScanNote();
   render();
 
   setPhase('probing');

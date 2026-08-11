@@ -18,7 +18,10 @@ const MIME = {
   '.js': 'text/javascript; charset=utf-8'
 };
 
-const IMAGE_RE = /^\/img\/(\d+)x(\d+)\.(png|jpg)$/;
+// The trailing group lets a filename carry a decoration - `250x200(2).png` - which
+// backgrounds.html needs to exercise the url() parser against a real request. The
+// size still comes from the leading WxH, so nothing else changes.
+const IMAGE_RE = /^\/img\/(\d+)x(\d+)([^/]*)\.(png|jpg)$/;
 // 500 for the first <fails> requests to this exact path, then the real image.
 const FLAKY_RE = /^\/flaky\/(\d+)\/(\d+)x(\d+)\.png$/;
 // The image the FIRST time, 500 every time after. A fixture page can render it
