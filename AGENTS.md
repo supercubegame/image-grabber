@@ -36,7 +36,9 @@ npm install && npm run verify:e2e   # browser gate (downloads Chrome)
 
 **Iron rule: no change is done until `npm run verify` exits 0.** CI runs both gates
 and writes a single report comment back to the PR (or to the commit when there is
-no PR). Read that comment; it carries the evidence.
+no PR). Read that comment; it carries the evidence. Each gate also tees its stdout
+into `test/artifacts/stdout-<slug>.log`, which is what the comment falls back to
+when a gate dies before it can write a report at all.
 
 ## Invariants
 
@@ -200,6 +202,14 @@ no PR). Read that comment; it carries the evidence.
   end satisfies "progress was reported" and satisfies nothing a user cares about. The
   popup also records every bar width it painted, so a bar that jumps straight to 100%
   leaves one entry behind and fails.
+- **A download baseline counts COMPLETED downloads, not download ENTRIES** - use
+  `completedCount()`. Reading `search({}).length` before a run and then waiting for
+  `complete >= before + N` holds only until something fails: an `interrupted` entry
+  counts towards the baseline and can never count towards `complete`, so the first
+  check that leaves a failed attempt behind makes the NEXT one unsatisfiable. It cost
+  a red run, and it cost it in the worst way - a 40s timeout instead of a failure,
+  which took three more checks down with it. A download wait that gives up reports
+  the arithmetic (expected / complete / interrupted / in flight), never an inventory.
 - When a critical step fails, later steps are skipped rather than reported as broken.
 - **New behaviour ships with a new assertion.** A feature the gate cannot see is a
   feature the next change can break for free.
