@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Grabber</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <h1>Image Grabber</h1>
+  <span id="status" class="status">starting</span>
+</header>
+<section class="filters">
+  <label class="chk">min w <input id="minWidth" type="number" min="0" step="10" value="0"></label>
+  <label class="chk">min h <input id="minHeight" type="number" min="0" step="10" value="0"></label>
+  <label class="chk"><input id="includeDataUrls" type="checkbox"> data:</label>
+  <div id="formats" class="formats"></div>
+</section>
+<section class="bar">
+  <label class="chk"><input id="selectAll" type="checkbox" checked> select all</label>
+  <span id="counts"></span>
+  <button id="download" type="button" disabled>Download</button>
+</section>
+<ul id="list" class="list"></ul>
+<p id="empty" class="empty" hidden>No images match the current filters.</p>
+<script type="module" src="popup.js"></script>
+</body>
+</html>

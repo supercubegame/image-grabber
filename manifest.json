@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Image Grabber",
+  "version": "0.1.0",
+  "description": "Scan the current page for images, filter by size and format, then download them in bulk.",
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Image Grabber"
+  },
+  "background": {
+    "service_worker": "src/background/service_worker.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "scripting", "downloads", "storage", "tabs"],
+  "host_permissions": ["<all_urls>"]
+}
