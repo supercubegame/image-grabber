@@ -154,8 +154,8 @@ which the comment falls back to when a gate dies before writing a report.
   - `EXPECTED.downloads.flakyFailures` (2) stays strictly BELOW `maxAttempts` and
     `flakyAttempts` = `flakyFailures + 1`; let them meet and the retry check is
     asserting a give-up instead of a recovery.
-- `MIN_UNIT_FILES` (8) / `MIN_UNIT_TESTS` (56) ↔ `test/unit/*` (64 tests in 8 files).
-  They exist so a runner that finds nothing fails loudly instead of exiting 0.
+- `MIN_UNIT_FILES` (8) / `MIN_UNIT_TESTS` (56) ↔ `test/unit/*` (65 tests in 8 files).
+  A FLOOR, so the count beside it can drift unnoticed - it had, by one. Re-read it.
 - `MAX_RULES_LINES` (200) ↔ this file, and `CLAUDE.md` must stay byte-identical. Both
   are gate conditions; edit one and copy it over the other.
 
