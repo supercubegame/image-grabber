@@ -1,0 +1,126 @@
+name: verify
+
+# Push-only on purpose: a pull_request trigger would double every run, and the
+# summary job finds the PR from the commit anyway.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: fast gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # continue-on-error so the report still uploads; the job is failed below.
+      - name: run fast gate
+        id: gate
+        continue-on-error: true
+        run: node scripts/verify.js
+      - name: upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-fast
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: fail if the gate failed
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  e2e:
+    name: browser gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: cache chrome download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: install
+        run: npm install --no-audit --no-fund
+      - name: run browser gate
+        id: gate
+        continue-on-error: true
+        run: node scripts/verify-e2e.js
+      - name: upload report and screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-e2e
+          path: test/artifacts/
+          if-no-files-found: error
+      - name: fail if the gate failed
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+  summary:
+    name: report
+    if: always()
+    needs: [fast, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: download reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: reports
+          pattern: report-*
+      - name: compose comment
+        run: node scripts/compose-report.js reports
+      # This step is deliberately NOT continue-on-error. If the write-back breaks,
+      # the run must go red: a monitor that fails silently is worse than none.
+      - name: post report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- image-grabber-verify -->';
+            const body = marker + '\n' + fs.readFileSync('comment.md', 'utf8');
+            const { owner, repo } = context.repo;
+
+            let prNumber = null;
+            const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: context.sha
+            });
+            const open = associated.data.find(pr => pr.state === 'open');
+            if (open) prNumber = open.number;
+
+            if (prNumber) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100
+              });
+              const existing = comments.find(c => c.body && c.body.includes(marker));
+              const result = existing
+                ? await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
+                : await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              const readback = await github.rest.issues.getComment({ owner, repo, comment_id: result.data.id });
+              if (!readback.data.body.includes(marker)) throw new Error('comment read-back did not contain the marker');
+              core.info(`report posted to PR #${prNumber} (comment ${result.data.id})`);
+            } else {
+              const result = await github.rest.repos.createCommitComment({
+                owner, repo, commit_sha: context.sha, body
+              });
+              const readback = await github.rest.repos.getCommitComment({ owner, repo, comment_id: result.data.id });
+              if (!readback.data.body.includes(marker)) throw new Error('commit comment read-back did not contain the marker');
+              core.info(`no open PR for this commit; report posted as a commit comment (${result.data.id})`);
+            }
+      - name: fail if any gate failed
+        run: node scripts/compose-report.js reports --check
