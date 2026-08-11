@@ -6,6 +6,12 @@
 
 export const KNOWN_FORMATS = ['png', 'jpg', 'gif', 'webp', 'svg', 'avif', 'bmp', 'ico', 'other'];
 
+// Where downloads land, and the storage key the settings live under. Both are
+// shared by the popup and the service worker: two copies of a string is two
+// places for them to disagree.
+export const DOWNLOAD_FOLDER = 'image-grabber';
+export const SETTINGS_KEY = 'settings';
+
 export const DEFAULT_SETTINGS = Object.freeze({
   minWidth: 0,
   minHeight: 0,
@@ -145,6 +151,18 @@ export function suggestFilename(item, index, settings) {
   const base = sanitize(baseName(item && item.url)) || 'image';
   const format = item && item.format && item.format !== 'other' ? item.format : 'img';
   return `${prefix}-${position}-${base}.${format}`;
+}
+
+// The single place a download path is built. Filter, number, prefix the folder -
+// once, for every trigger. The popup's Download button and the page context menu
+// both call this; if either one assembled paths on its own the two would drift
+// and only one of them would be covered by the gate.
+export function planDownloads(items, settings) {
+  const config = mergeSettings(settings);
+  return applyFilters(items, config).map((item, index) => ({
+    url: item.url,
+    filename: `${DOWNLOAD_FOLDER}/${suggestFilename(item, index, config)}`
+  }));
 }
 
 export function summarize(items) {
