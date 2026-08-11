@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Grabber lazy gallery (breaks half-way)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; }
+  .item { display: block; width: 200px; height: 400px; object-fit: contain; background: #eee; }
+  .sentinel { height: 120px; color: #888; }
+  /* Fixed height so the banner changes the page exactly once. */
+  .error { height: 60px; color: #b91c1c; }
+</style>
+</head>
+<body>
+<h1>lazy gallery (breaks half-way)</h1>
+<!--
+  3 images on load, one successful batch of 3, then the loader fails and gives up:
+  6 images total and the page never grows again.
+
+  The failure is client-side and caught on purpose. A 404/500 would put "failed to
+  load resource" in the console and turn the gate's zero-console-errors check red
+  for a reason that has nothing to do with the extension.
+-->
+<div id="items"></div>
+<div class="sentinel" id="sentinel">scroll for more</div>
+<script>
+  var BATCH_SIZE = 3;
+  var LOAD_DELAY_MS = 120;
+  var loading = false;
+  var served = 0;
+
+  window.__FIXTURE__ = { kind: 'broken', batches: 0, images: 0, failed: false };
+
+  function add(count) {
+    var box = document.getElementById('items');
+    for (var i = 0; i < count; i++) {
+      served++;
+      var img = document.createElement('img');
+      img.className = 'item';
+      img.src = 'img/' + (500 + served) + 'x' + (400 + served) + '.png';
+      img.alt = 'broken ' + served;
+      box.appendChild(img);
+    }
+    window.__FIXTURE__.images = document.images.length;
+  }
+
+  function failLoud() {
+    var banner = document.createElement('p');
+    banner.className = 'error';
+    banner.textContent = 'Failed to load more images.';
+    document.body.appendChild(banner);
+    document.getElementById('sentinel').textContent = 'stopped';
+    window.__FIXTURE__.failed = true;
+  }
+
+  function nearBottom() {
+    return window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 150;
+  }
+
+  window.addEventListener('scroll', function () {
+    if (loading || window.__FIXTURE__.failed || !nearBottom()) return;
+    loading = true;
+    setTimeout(function () {
+      if (window.__FIXTURE__.batches >= 1) {
+        failLoud();
+      } else {
+        window.__FIXTURE__.batches++;
+        add(BATCH_SIZE);
+      }
+      loading = false;
+    }, LOAD_DELAY_MS);
+  });
+
+  add(BATCH_SIZE);
+</script>
+</body>
+</html>
