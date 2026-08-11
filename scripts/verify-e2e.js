@@ -138,7 +138,9 @@ const steps = [
     run: async () => {
       ctx.extDir = stageExtension();
       ctx.server = await startServer();
-      ctx.downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'image-grabber-dl-'));
+      // No CDP Browser.setDownloadBehavior here: pointing it at a download path makes
+      // Chrome auto-name files from the URL, which silently throws away the filename
+      // chrome.downloads was given. We read the path Chrome reports back instead.
       ctx.browser = await puppeteer.launch({
         headless: true,
         timeout: LAUNCH_TIMEOUT_MS,
@@ -154,15 +156,6 @@ const steps = [
           `--load-extension=${ctx.extDir}`
         ]
       });
-      let downloadNote = '';
-      try {
-        const cdp = await ctx.browser.target().createCDPSession();
-        await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: ctx.downloadDir, eventsEnabled: true });
-      } catch (err) {
-        // Not an assertion: the download check reads the path Chrome reports back,
-        // wherever that turns out to be.
-        downloadNote = ` (download dir override unavailable: ${err.message})`;
-      }
       const target = await ctx.browser.waitForTarget(
         t => t.type() === 'service_worker' && t.url().startsWith('chrome-extension://'),
         { timeout: 30000 }
@@ -175,7 +168,7 @@ const steps = [
         diag: typeof self.__DIAG__
       }));
       if (info.diag !== 'object') throw new Error('service worker exposes no __DIAG__ object');
-      return `"${info.name}" v${info.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}${downloadNote}`;
+      return `"${info.name}" v${info.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}`;
     }
   },
   {
@@ -319,14 +312,17 @@ const steps = [
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.downloadCount;
       }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => ctx.downloads });
       const done = (ctx.downloads || []).filter(i => i.state === 'complete');
+      const paths = done.map(i => i.filename);
       const onDisk = done.filter(i => i.filename && fs.existsSync(i.filename) && fs.statSync(i.filename).size > 0);
       if (onDisk.length !== done.length) {
         throw evidenceError('chrome reported complete downloads that are not on disk', done.map(i => ({ filename: i.filename, state: i.state, bytes: i.bytesReceived })));
       }
       const names = onDisk.map(i => path.basename(i.filename));
-      if (!names.some(n => n.startsWith('img-001-400x300'))) throw evidenceError('expected img-001-400x300.png among the downloads', names);
+      if (!names.some(n => n.startsWith('img-001-400x300'))) {
+        throw evidenceError('the generated filename was not used - expected img-001-400x300.png among the downloads', paths.join('\n'));
+      }
       const folders = onDisk.map(i => path.basename(path.dirname(i.filename)));
-      if (!folders.every(f => f === 'image-grabber')) throw evidenceError('downloads did not land in the image-grabber folder', onDisk.map(i => i.filename));
+      if (!folders.every(f => f === 'image-grabber')) throw evidenceError('downloads did not land in the image-grabber folder', paths.join('\n'));
       return `${onDisk.length} files written: ${onDisk.map(i => `${path.basename(i.filename)} (${fs.statSync(i.filename).size}B)`).join(', ')}`;
     }
   },

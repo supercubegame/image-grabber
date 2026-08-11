@@ -47,9 +47,25 @@ report.check('manifest.json is valid MV3 and references only files that exist', 
 
 report.check('files injected or linked at runtime exist on disk', () => {
   const sw = read('src/background/service_worker.js');
-  const injected = Array.from(sw.matchAll(/files:\s*\[([^\]]*)\]/g))
-    .flatMap(m => Array.from(m[1].matchAll(/['"]([^'"]+)['"]/g)).map(x => x[1]));
-  if (!injected.length) throw fail('found no injected content script in the service worker - did the injection move?', tail(sw, 40));
+  // Injected paths are usually referenced through a const, not written inline, so
+  // resolve identifiers as well. Matching only quoted literals made this check
+  // report "no content script found" while the injection was working fine.
+  const constants = new Map();
+  for (const m of sw.matchAll(/const\s+([A-Za-z_$][\w$]*)\s*=\s*['"]([^'"]+)['"]/g)) constants.set(m[1], m[2]);
+  const blocks = Array.from(sw.matchAll(/files:\s*\[([^\]]*)\]/g)).map(m => m[1]);
+  if (!blocks.length) throw fail('no files: [...] injection found in the service worker - did the injection move?', tail(sw, 40));
+  const injected = [];
+  const unresolved = [];
+  for (const block of blocks) {
+    for (const token of block.split(',').map(t => t.trim()).filter(Boolean)) {
+      const quoted = /^['"]([^'"]+)['"]$/.exec(token);
+      if (quoted) injected.push(quoted[1]);
+      else if (constants.has(token)) injected.push(constants.get(token));
+      else unresolved.push(token);
+    }
+  }
+  if (unresolved.length) throw fail('could not resolve injected script reference(s): ' + unresolved.join(', '), Array.from(constants.entries()).map(e => e.join(' = ')).join('\n'));
+  if (!injected.length) throw fail('the service worker injects nothing', tail(sw, 40));
   const html = read('src/popup/popup.html');
   const linked = Array.from(html.matchAll(/(?:src|href)="([^"]+)"/g))
     .map(m => m[1])
@@ -59,7 +75,7 @@ report.check('files injected or linked at runtime exist on disk', () => {
   for (const f of injected) if (!exists(f)) missing.push(f);
   for (const f of linked) if (!exists(path.posix.join('src/popup', f))) missing.push('src/popup/' + f);
   if (missing.length) throw fail('missing files: ' + missing.join(', '), [...injected, ...linked].join('\n'));
-  return `${injected.length} injected + ${linked.length} linked assets present`;
+  return `${injected.length} injected (${injected.join(', ')}) + ${linked.length} linked assets present`;
 });
 
 report.check('src/core stays pure (no DOM, chrome API, clock or unseeded randomness)', () => {

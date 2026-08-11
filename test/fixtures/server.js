@@ -26,6 +26,16 @@ function gradient(width, height) {
 export function startServer(port = 0) {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
+
+    // A real browser asks for this unprompted. Answering 404 makes the
+    // zero-console-errors check fail for a reason that has nothing to do with the
+    // extension - and that check is worth keeping strict.
+    if (url.pathname === '/favicon.ico') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const image = /^\/img\/(\d+)x(\d+)\.(png|jpg)$/.exec(url.pathname);
     if (image) {
       // Note: the .jpg route serves PNG bytes on purpose. Format classification is
@@ -36,6 +46,7 @@ export function startServer(port = 0) {
       res.end(buf);
       return;
     }
+
     const rel = url.pathname === '/' ? 'gallery.html' : url.pathname.replace(/^\/+/, '');
     const file = path.join(DIR, rel);
     if (!file.startsWith(DIR) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
