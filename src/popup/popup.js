@@ -1,5 +1,6 @@
 // Popup controller: DOM, storage and messaging only. Anything decision-shaped
-// lives in ../core/images.js so it can be unit tested without a browser.
+// lives in ../core/images.js and ../core/scroll.js so it can be unit tested
+// without a browser.
 import {
   KNOWN_FORMATS,
   SETTINGS_KEY,
@@ -26,14 +27,16 @@ const state = {
   downloadRequested: 0,
   downloadIds: [],
   errors: [],
-  pageUrl: ''
+  pageUrl: '',
+  tabId: null,
+  scroll: null
 };
 
 // Read-only diagnostic surface for the verification gate.
 // Fields may be ADDED, never renamed or removed (see AGENTS.md).
 Object.defineProperty(window, '__DIAG__', {
   value: Object.freeze({
-    version: '0.2.0',
+    version: '0.3.0',
     get state() {
       return {
         phase: state.phase,
@@ -46,12 +49,14 @@ Object.defineProperty(window, '__DIAG__', {
         probed: state.probed,
         downloadRequested: state.downloadRequested,
         downloadIds: state.downloadIds.slice(),
+        scroll: state.scroll,
         settings: {
           minWidth: state.settings.minWidth,
           minHeight: state.settings.minHeight,
           includeDataUrls: state.settings.includeDataUrls,
           formats: state.settings.formats.slice(),
-          filenamePrefix: state.settings.filenamePrefix
+          filenamePrefix: state.settings.filenamePrefix,
+          scroll: { ...state.settings.scroll }
         },
         items: state.all.map(item => ({
           url: item.url,
@@ -118,6 +123,8 @@ function syncControls() {
   byId('minWidth').value = String(state.settings.minWidth);
   byId('minHeight').value = String(state.settings.minHeight);
   byId('includeDataUrls').checked = state.settings.includeDataUrls;
+  byId('autoScroll').checked = state.settings.scroll.enabled;
+  byId('maxImages').value = String(state.settings.scroll.maxImages);
 }
 
 function toSize(value) {
@@ -138,6 +145,19 @@ function bindEvents() {
     state.settings.includeDataUrls = byId('includeDataUrls').checked;
     onSettingsChanged();
   });
+  // Auto-scroll changes what the page contains, not how the results are filtered,
+  // so it has to rescan. A checkbox that only takes effect the next time the popup
+  // opens reads as a broken checkbox.
+  byId('autoScroll').addEventListener('change', () => {
+    state.settings.scroll.enabled = byId('autoScroll').checked;
+    saveSettings().catch(recordError);
+    rescan().catch(recordError);
+  });
+  // The cap only applies to the next scroll run, so this one just persists.
+  byId('maxImages').addEventListener('input', () => {
+    state.settings.scroll.maxImages = toSize(byId('maxImages').value);
+    saveSettings().catch(recordError);
+  });
   byId('selectAll').addEventListener('change', () => {
     if (byId('selectAll').checked) for (const item of state.visible) state.selected.add(item.url);
     else state.selected.clear();
@@ -156,6 +176,25 @@ function shortName(url) {
   } catch {
     return url.slice(0, 40);
   }
+}
+
+// The banner is the popup's version of the badge "?": if the scroll run gave up,
+// the list below it is a partial page and the user has to be told so.
+function renderScrollNote() {
+  const note = byId('scrollNote');
+  const summary = state.scroll;
+  if (!summary) {
+    note.hidden = true;
+    note.textContent = '';
+    note.classList.remove('warn');
+    return;
+  }
+  const moved = `${summary.scrolls}\u00d7 scrolled \u00b7 ${summary.imagesAtStart} \u2192 ${summary.imagesAtEnd} images`;
+  note.hidden = false;
+  note.classList.toggle('warn', summary.reachedEnd !== true);
+  note.textContent = summary.reachedEnd
+    ? `${moved} \u00b7 reached the end (${summary.outcome})`
+    : `${moved} \u00b7 END NOT CONFIRMED (${summary.outcome}) \u2013 there may be more below`;
 }
 
 function render() {
@@ -190,7 +229,7 @@ function render() {
     name.textContent = shortName(item.url);
     const dims = document.createElement('span');
     dims.className = 'dims';
-    dims.textContent = `${item.width || '?'}×${item.height || '?'} · ${item.format}`;
+    dims.textContent = `${item.width || '?'}\u00d7${item.height || '?'} \u00b7 ${item.format}`;
     meta.append(name, dims);
 
     row.append(checkbox, thumb, meta);
@@ -198,7 +237,7 @@ function render() {
   }
 
   byId('empty').hidden = state.visible.length > 0;
-  byId('counts').textContent = `${state.selected.size}/${state.visible.length} selected · ${state.all.length} found`;
+  byId('counts').textContent = `${state.selected.size}/${state.visible.length} selected \u00b7 ${state.all.length} found`;
   byId('download').disabled = state.selected.size === 0;
 }
 
@@ -245,31 +284,38 @@ function recordError(err) {
   byId('status').textContent = 'error: ' + message;
 }
 
-async function main() {
-  state.settings = await loadSettings();
-  renderFormatFilters();
-  syncControls();
-  bindEvents();
-  render();
-  setPhase('scanning');
-
-  // `?tabId=` is a read-only override used by the verification gate; without it the
-  // popup targets the active tab exactly as a user would expect.
-  const params = new URLSearchParams(location.search);
-  const tabId = params.has('tabId') ? Number(params.get('tabId')) : await activeTabId();
-
-  const response = await send({ type: 'scan', tabId });
+async function rescan() {
+  if (state.tabId === null) throw new Error('rescan before a tab was resolved');
+  setPhase(state.settings.scroll.enabled ? 'scrolling' : 'scanning');
+  const response = await send({ type: 'scan', tabId: state.tabId, scroll: state.settings.scroll });
   if (!response || !response.ok) throw new Error(response && response.error ? response.error : 'scan failed');
 
   state.pageUrl = response.data.pageUrl;
   state.rawCandidates = response.data.candidates.length;
+  state.scroll = response.data.scroll || null;
   state.all = normalizeCandidates(response.data.candidates, response.data.pageUrl);
+  renderScrollNote();
   render();
 
   setPhase('probing');
   await probeUnknown();
   render();
   setPhase('ready');
+}
+
+async function main() {
+  state.settings = await loadSettings();
+  renderFormatFilters();
+  syncControls();
+  bindEvents();
+  render();
+
+  // `?tabId=` is a read-only override used by the verification gate; without it the
+  // popup targets the active tab exactly as a user would expect.
+  const params = new URLSearchParams(location.search);
+  state.tabId = params.has('tabId') ? Number(params.get('tabId')) : await activeTabId();
+
+  await rescan();
 }
 
 main().catch(recordError);
