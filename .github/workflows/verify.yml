@@ -21,11 +21,21 @@ jobs:
         with:
           node-version: '20'
       # continue-on-error so the report still uploads; the job is failed below.
+      #
+      # stdout is teed to a file because it is the only evidence that survives a gate
+      # that dies before writing its report - and the CI log itself is not something
+      # the agent reading the posted comment can open. pipefail keeps the step's
+      # outcome tied to node's exit code rather than tee's.
       - name: run fast gate
         id: gate
         continue-on-error: true
-        run: node scripts/verify.js
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify.js 2>&1 | tee test/artifacts/stdout-fast.log
       - name: upload report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: report-fast
@@ -53,8 +63,13 @@ jobs:
       - name: run browser gate
         id: gate
         continue-on-error: true
-        run: node scripts/verify-e2e.js
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p test/artifacts
+          node scripts/verify-e2e.js 2>&1 | tee test/artifacts/stdout-e2e.log
       - name: upload report and screenshots
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: report-e2e
@@ -87,6 +102,10 @@ jobs:
         run: node scripts/compose-report.js reports
       # This step is deliberately NOT continue-on-error. If the write-back breaks,
       # the run must go red: a monitor that fails silently is worse than none.
+      #
+      # The comment also goes to the job summary FIRST. A failed write-back used to
+      # take the whole report down with it; now the evidence is at least on the run
+      # page for a human, even when nothing can be posted.
       - name: post report
         uses: actions/github-script@v7
         with:
@@ -95,6 +114,8 @@ jobs:
             const marker = '<!-- image-grabber-verify -->';
             const body = marker + '\n' + fs.readFileSync('comment.md', 'utf8');
             const { owner, repo } = context.repo;
+
+            await core.summary.addRaw(fs.readFileSync('comment.md', 'utf8')).write();
 
             let prNumber = null;
             const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
