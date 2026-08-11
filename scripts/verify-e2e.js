@@ -113,12 +113,21 @@ async function resolveTabId(url) {
   }, url);
 }
 
-// Every load gets a fresh ?run= so the browser cannot restore the previous scroll
-// position or reuse a warm document. A scroll test that starts half way down the
-// page passes for the wrong reason.
+// Two things matter here and both cost a red run to learn:
+//
+// 1. Every load gets a fresh ?run= so the browser cannot restore the previous
+//    scroll position. A scroll test that starts half way down passes for the wrong
+//    reason.
+// 2. The tab has to be in the FOREGROUND. Chrome throttles timers in hidden tabs,
+//    and the fixtures load their next batch on a setTimeout - in a background tab
+//    that batch never arrives, the page sits at its initial images and the run
+//    settles, honestly reporting a bottom that only exists because the page was
+//    asleep. A real user always scrolls the tab they are looking at, so this is the
+//    accurate simulation rather than a workaround.
 async function loadFixture(tab) {
   ctx.navigations += 1;
   tab.url = `${ctx.server.origin}/${tab.name}?run=${ctx.navigations}`;
+  await tab.page.bringToFront();
   await tab.page.goto(tab.url, { waitUntil: 'networkidle2', timeout: 30000 });
   tab.tabId = await resolveTabId(tab.url);
   if (tab.tabId < 0) throw evidenceError(`the extension could not find the tab for ${tab.name}`, tab.url);
@@ -129,6 +138,26 @@ async function openFixtureTab(name, label) {
   const page = await ctx.browser.newPage();
   watch(page, label);
   return loadFixture({ name, label, page, url: null, tabId: -1 });
+}
+
+// Evidence for any scroll failure. The summary alone cannot say whether the page was
+// even able to scroll, which is the first thing you want to know when a lazy page
+// did not grow.
+async function scrollEvidence(tab, summary) {
+  let page;
+  try {
+    page = await tab.page.evaluate(() => ({
+      fixture: window.__FIXTURE__ || null,
+      images: document.images.length,
+      scrollY: Math.round(window.scrollY),
+      innerHeight: window.innerHeight,
+      scrollHeight: document.documentElement.scrollHeight,
+      hidden: document.hidden
+    }));
+  } catch (err) {
+    page = { readFailed: err && err.message ? err.message : String(err) };
+  }
+  return { url: tab.url, summary, page };
 }
 
 async function scanWith(tabId, scroll) {
@@ -514,8 +543,8 @@ const steps = [
 
       const scrolled = await scanWith(ctx.finite.tabId, GATE_SCROLL);
       const summary = scrolled.scroll;
-      ctx.lastDiag = summary;
       if (!summary) throw evidenceError('scrolling was requested but no scroll summary came back', scrolled);
+      ctx.lastDiag = await scrollEvidence(ctx.finite, summary);
       expect(scrolled.candidates.length, EXPECTED.scroll.finiteTotalImages, 'images after auto-scroll');
       expect(summary.outcome, 'settled', 'scroll outcome on a page that ends');
       expect(summary.reachedEnd, true, 'reachedEnd');
@@ -524,7 +553,7 @@ const steps = [
       if (summary.warning !== null) throw evidenceError('a confirmed end still carried a warning', summary);
       // The one comparison that can only hold if the feature does something.
       if (scrolled.candidates.length <= plain.candidates.length) {
-        throw evidenceError('auto-scroll found no more images than a plain scan', { plain: plain.candidates.length, scrolled: scrolled.candidates.length, summary });
+        throw evidenceError('auto-scroll found no more images than a plain scan', ctx.lastDiag);
       }
       return `${plain.candidates.length} -> ${scrolled.candidates.length} images in ${summary.scrolls} scrolls, settled after ${summary.stableRounds} unchanged rounds`;
     }
@@ -535,17 +564,17 @@ const steps = [
       ctx.endless = await openFixtureTab('scroll-endless.html', 'endless lazy fixture');
       const data = await scanWith(ctx.endless.tabId, ENDLESS_SCROLL);
       const summary = data.scroll;
-      ctx.lastDiag = summary;
+      ctx.lastDiag = await scrollEvidence(ctx.endless, summary);
       expect(summary.outcome, 'max-scrolls', 'scroll outcome on a page with no bottom');
       expect(summary.reachedEnd, false, 'reachedEnd');
       expect(summary.scrolls, ENDLESS_SCROLL.maxScrolls, 'scrolls performed before giving up');
       if (!summary.warning || !/NOT confirmed/.test(summary.warning)) {
-        throw evidenceError('a run that gave up came back without a warning saying so', summary);
+        throw evidenceError('a run that gave up came back without a warning saying so', ctx.lastDiag);
       }
       // Giving up is not the same as returning nothing: it still hands back what it
       // did see.
       if (data.candidates.length < EXPECTED.scroll.endlessMinImages) {
-        throw evidenceError(`only ${data.candidates.length} images collected before the cap, expected at least ${EXPECTED.scroll.endlessMinImages}`, summary);
+        throw evidenceError(`only ${data.candidates.length} images collected before the cap, expected at least ${EXPECTED.scroll.endlessMinImages}`, ctx.lastDiag);
       }
       return `gave up after ${summary.scrolls} scrolls with ${data.candidates.length} images - ${summary.warning}`;
     }
@@ -556,16 +585,21 @@ const steps = [
       await loadFixture(ctx.endless);
       const data = await scanWith(ctx.endless.tabId, TIMEOUT_SCROLL);
       const summary = data.scroll;
-      ctx.lastDiag = summary;
+      ctx.lastDiag = await scrollEvidence(ctx.endless, summary);
       expect(summary.outcome, 'timeout', 'scroll outcome when the clock runs out first');
       expect(summary.reachedEnd, false, 'reachedEnd');
+      // A page that never grew would settle long before this deadline, so timing out
+      // only means something if the page was genuinely still feeding us.
+      if (summary.growthRounds < 1) {
+        throw evidenceError('the page produced no new images at all, so the timeout proves nothing here', ctx.lastDiag);
+      }
       if (summary.elapsedMs < TIMEOUT_SCROLL.timeoutMs) {
-        throw evidenceError(`the timeout fired at ${summary.elapsedMs}ms, before its own ${TIMEOUT_SCROLL.timeoutMs}ms deadline`, summary);
+        throw evidenceError(`the timeout fired at ${summary.elapsedMs}ms, before its own ${TIMEOUT_SCROLL.timeoutMs}ms deadline`, ctx.lastDiag);
       }
       // Only here to catch a timeout that never actually stops anything. The ceiling
       // keeps ~10x margin over the deadline; it is not a performance budget.
       if (summary.elapsedMs > EXPECTED.scroll.timeoutCeilingMs) {
-        throw evidenceError(`the run kept going for ${summary.elapsedMs}ms, long past its ${TIMEOUT_SCROLL.timeoutMs}ms timeout`, summary);
+        throw evidenceError(`the run kept going for ${summary.elapsedMs}ms, long past its ${TIMEOUT_SCROLL.timeoutMs}ms timeout`, ctx.lastDiag);
       }
       return `stopped at ${summary.elapsedMs}ms (deadline ${TIMEOUT_SCROLL.timeoutMs}ms) after ${summary.scrolls} scrolls, end not confirmed`;
     }
@@ -576,12 +610,12 @@ const steps = [
       ctx.broken = await openFixtureTab('scroll-broken.html', 'half-broken lazy fixture');
       const data = await scanWith(ctx.broken.tabId, GATE_SCROLL);
       const summary = data.scroll;
-      ctx.lastDiag = summary;
+      ctx.lastDiag = await scrollEvidence(ctx.broken, summary);
       // Without this the check is meaningless: a fixture that quietly finished on its
       // own would produce identical numbers and prove nothing about a failure.
       const fixture = await ctx.broken.page.evaluate(() => window.__FIXTURE__);
       if (fixture.failed !== true || fixture.batches !== 1) {
-        throw evidenceError('the fixture never actually failed, so this check proves nothing', fixture);
+        throw evidenceError('the fixture never actually failed, so this check proves nothing', ctx.lastDiag);
       }
       expect(data.candidates.length, EXPECTED.scroll.brokenTotalImages, 'images collected from a page that broke');
       expect(summary.growthRounds, EXPECTED.scroll.brokenGrowthRounds, 'rounds in which new images arrived');
@@ -598,17 +632,17 @@ const steps = [
       await loadFixture(ctx.endless);
       const data = await scanWith(ctx.endless.tabId, CAP_SCROLL);
       const summary = data.scroll;
-      ctx.lastDiag = summary;
+      ctx.lastDiag = await scrollEvidence(ctx.endless, summary);
       expect(summary.outcome, 'image-cap', 'scroll outcome when the cap is reached');
       expect(summary.reachedEnd, true, 'reachedEnd');
-      if (summary.warning !== null) throw evidenceError('stopping at the requested count is not a failure and must not warn', summary);
+      if (summary.warning !== null) throw evidenceError('stopping at the requested count is not a failure and must not warn', ctx.lastDiag);
       if (summary.imagesAtEnd < EXPECTED.scroll.imageCap) {
-        throw evidenceError(`stopped at ${summary.imagesAtEnd} images, below the ${EXPECTED.scroll.imageCap} that were asked for`, summary);
+        throw evidenceError(`stopped at ${summary.imagesAtEnd} images, below the ${EXPECTED.scroll.imageCap} that were asked for`, ctx.lastDiag);
       }
       // If it had run all the way to the scroll cap as well, the outcome above would
       // be a coincidence rather than proof the image cap did anything.
       if (summary.scrolls >= CAP_SCROLL.maxScrolls) {
-        throw evidenceError('the run reached the scroll cap too, so the image cap proves nothing here', summary);
+        throw evidenceError('the run reached the scroll cap too, so the image cap proves nothing here', ctx.lastDiag);
       }
       return `stopped at ${summary.imagesAtEnd} images after ${summary.scrolls} scrolls (cap ${EXPECTED.scroll.imageCap}, scroll cap ${CAP_SCROLL.maxScrolls} untouched)`;
     }
@@ -630,7 +664,7 @@ const steps = [
       await loadFixture(ctx.finite);
       const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
       const data = await bulkWith(ctx.finite.tabId, GATE_SCROLL);
-      ctx.lastDiag = data;
+      ctx.lastDiag = await scrollEvidence(ctx.finite, data);
       expect(data.found, EXPECTED.scroll.finiteTotalImages, 'images found by the scrolling bulk run');
       expect(data.planned, EXPECTED.scroll.finiteTotalImages, 'images queued');
       expect(data.endConfirmed, true, 'endConfirmed');
@@ -655,13 +689,13 @@ const steps = [
       await loadFixture(ctx.endless);
       const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
       const data = await bulkWith(ctx.endless.tabId, ENDLESS_SCROLL);
-      ctx.lastDiag = data;
+      ctx.lastDiag = await scrollEvidence(ctx.endless, data);
       expect(data.endConfirmed, false, 'endConfirmed on a page with no bottom');
       if (!data.warning || !/NOT confirmed/.test(data.warning)) {
-        throw evidenceError('the bulk result carried no warning about the unconfirmed end', data);
+        throw evidenceError('the bulk result carried no warning about the unconfirmed end', ctx.lastDiag);
       }
       if (data.planned < EXPECTED.scroll.endlessMinImages) {
-        throw evidenceError(`only ${data.planned} images queued, expected at least ${EXPECTED.scroll.endlessMinImages}`, data);
+        throw evidenceError(`only ${data.planned} images queued, expected at least ${EXPECTED.scroll.endlessMinImages}`, ctx.lastDiag);
       }
 
       await waitFor(`${data.planned} unconfirmed bulk downloads to complete`, async () => {
