@@ -19,8 +19,15 @@ export const EXPECTED = {
   contextMenuId: 'download-all-images',
   bulkDownloads: 5,
   bulkSkipped: 1,
-  // Colour thresholds keep a wide margin: the populated popup renders five gradient
-  // thumbnails and measures in the hundreds. These only catch a blank render.
-  minColorsPopulated: 40,
-  minColorDelta: 30
+  // How many more distinct colours the populated popup shows than the empty one.
+  //
+  // A delta, deliberately - NOT an absolute floor. There used to be a
+  // `minColorsPopulated: 40` here and it was vacuous: the empty popup samples 395
+  // colours from its own background, so it passed with the list completely broken.
+  // Only the difference between the two screenshots can come from thumbnails.
+  //
+  // Measured in CI: 395 empty -> 1851 populated, delta 1456. The floor keeps ~3.6x
+  // margin; it is here to catch "nothing rendered", not to benchmark the renderer.
+  // Add or remove a fixture thumbnail and this moves with defaultVisible.
+  minColorDelta: 400
 };

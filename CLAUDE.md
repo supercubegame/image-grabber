@@ -78,6 +78,9 @@ no PR). Read that comment; it carries the evidence.
   path takes every unique image except the ones the stored filters drop, so
   `bulkDownloads + bulkSkipped === uniqueImages` at default settings. Add an image to
   the fixture and all three move.
+- `EXPECTED.minColorDelta` (400) ↔ the number of fixture thumbnails. Measured delta is
+  1456 (395 empty -> 1851 populated); the floor keeps ~3.6x margin. Change how many
+  images the popup shows by default and re-measure.
 - `MIN_UNIT_FILES` (5) / `MIN_UNIT_TESTS` (20) in scripts/verify.js ↔ `test/unit/*`
   (24 tests in 5 files today). They exist so a runner that finds no tests fails
   loudly instead of exiting 0. Add tests, raise the floor.
@@ -91,6 +94,13 @@ no PR). Read that comment; it carries the evidence.
   posted comment alone cannot get you to the root cause, the report is incomplete.
 - Colour and timing thresholds only catch "nothing rendered" / "hung". Keep at least
   3x margin; CI has no GPU and shared CPU.
+- **Prefer a delta over an absolute floor.** An absolute colour floor lived here for a
+  while and could never fail: the empty popup already samples ~395 colours of its own
+  chrome, so it passed with the list completely broken. Assert the difference between
+  two states - that part can only come from the feature.
+- **Ask it of every new assertion: if this feature were missing, would this fail?** If
+  not, it is not an assertion, it is decoration - and a green decoration is worse than
+  a missing check, because nobody goes looking for it.
 - When a critical step fails, later steps are skipped rather than reported as broken.
 - **New behaviour ships with a new assertion.** A feature the gate cannot see is a
   feature the next change can break for free.
