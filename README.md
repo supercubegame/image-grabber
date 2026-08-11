@@ -1,15 +1,19 @@
 # Image Grabber
 
 A Chrome MV3 extension that scans the current page for images, filters them by size
-and format, and downloads the selected ones in bulk.
+and format, and downloads them in bulk.
 
 ## Try it
 
 1. `chrome://extensions` → enable **Developer mode**
 2. **Load unpacked** → pick this folder
-3. Open any image-heavy page and click the toolbar icon
+3. Open any image-heavy page, then either:
+   - click the toolbar icon to pick images by hand, or
+   - right-click anywhere on the page → **Download all images on this page**
 
-Downloads land in `image-grabber/` inside your Chrome download folder.
+The right-click route reuses whatever filters you last set in the popup and shows the
+number of queued files on the toolbar badge. Downloads land in `image-grabber/` inside
+your Chrome download folder.
 
 ## Verify
 
