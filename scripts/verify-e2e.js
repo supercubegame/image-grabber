@@ -516,6 +516,141 @@ const steps = [
     }
   },
   {
+    title: 'backgrounds behind GENERATED pseudo-elements are collected, and one that is never generated is not',
+    run: async () => {
+      // Earlier steps left minWidth=200 with jpg off. This page is scanned with the
+      // defaults, so clear them first or the counts below mean something else.
+      await swEval(() => chrome.storage.local.remove('settings'));
+      const url = ctx.server.origin + '/backgrounds.html';
+      ctx.backgrounds = await ctx.browser.newPage();
+      watch(ctx.backgrounds, 'css backgrounds fixture');
+      await ctx.backgrounds.bringToFront();
+      await ctx.backgrounds.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      const tabId = await resolveTabId(url);
+      if (tabId < 0) throw new Error('could not resolve the css backgrounds tab');
+      const imgCount = await ctx.backgrounds.evaluate(() => document.images.length);
+      if (imgCount !== EXPECTED.backgrounds.imgElements) {
+        throw evidenceError(`the fixture has ${imgCount} <img> elements, expected ${EXPECTED.backgrounds.imgElements} - then the css urls are not the only thing being counted below`, url);
+      }
+
+      // Non-vacuity for the NEGATIVE half, measured rather than assumed: Chrome does
+      // hand out a computed background for a ::before that was never generated. If
+      // that ever stopped being true, "the ghost image was not collected" would pass
+      // for free and this step would quietly stop testing the interesting part.
+      const ghost = await ctx.backgrounds.evaluate(() => {
+        const style = getComputedStyle(document.querySelector('.ghost'), '::before');
+        return { background: style.backgroundImage, content: style.content };
+      });
+      if (!ghost.background.includes(EXPECTED.backgrounds.ghost)) {
+        throw evidenceError('the never-generated ::before no longer names an image in its computed style, so proving the collector skipped it proves nothing', ghost);
+      }
+
+      await openPopup(tabId);
+      const state = await diag();
+      ctx.lastDiag = state;
+      const urls = state.items.map(i => i.url);
+      const has = suffix => urls.some(u => u.endsWith(suffix));
+      const wanted = [
+        EXPECTED.backgrounds.pseudoBefore,
+        EXPECTED.backgrounds.pseudoAfter,
+        EXPECTED.backgrounds.parens,
+        ...EXPECTED.backgrounds.layered
+      ];
+      const missing = wanted.filter(suffix => !has(suffix));
+      if (missing.length) {
+        throw evidenceError(`${missing.length} of ${wanted.length} css background(s) never reached the scan: ${missing.join(', ')}`, urls.join('\n'));
+      }
+      if (has(EXPECTED.backgrounds.ghost)) {
+        throw evidenceError('a background on a ::before that is never generated was collected - the scan is listing images that are nowhere on the page', urls.join('\n'));
+      }
+      expect(state.scanned, EXPECTED.backgrounds.uniqueImages, 'unique images on the backgrounds fixture');
+      const probed = state.items.find(i => i.url.endsWith(EXPECTED.backgrounds.probed.path));
+      expect(probed.width, EXPECTED.backgrounds.probed.width, 'probed width of the ::before background');
+      expect(probed.height, EXPECTED.backgrounds.probed.height, 'probed height of the ::before background');
+      // This page is far inside the element limit, so the incomplete-scan banner must
+      // be nowhere in sight. A warning that is always on is not a warning.
+      expect(state.coverage.complete, true, 'coverage.complete on a page inside the element limit');
+      const bannerHidden = await ctx.popup.evaluate(() => document.getElementById('scanNote').hidden);
+      if (!bannerHidden) throw evidenceError('a fully inspected page still showed the incomplete-scan banner', state.coverage);
+      return `${state.scanned} unique: ::before, ::after, a bracketed url and 2 layered urls; the never-generated ::before stayed out; ::before probed to ${probed.width}x${probed.height}`;
+    }
+  },
+  {
+    title: 'a page bigger than the element limit reports an incomplete scan instead of a clean one',
+    run: async () => {
+      await swEval(() => chrome.storage.local.remove('settings'));
+      const url = ctx.server.origin + '/many-elements.html';
+      ctx.huge = await ctx.browser.newPage();
+      watch(ctx.huge, 'element limit fixture');
+      await ctx.huge.bringToFront();
+      await ctx.huge.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      const fixture = await ctx.huge.evaluate(() => window.__FIXTURE__);
+      const tabId = await resolveTabId(url);
+      if (tabId < 0) throw new Error('could not resolve the element limit tab');
+
+      const data = await scanWith(tabId, null);
+      const coverage = data.coverage;
+      ctx.lastDiag = { fixture, coverage, candidates: data.candidates.length };
+      // Non-vacuity: if the filler never built, this page fits inside the limit and
+      // everything below would be describing a perfectly honest complete scan.
+      if (!coverage || coverage.elementsTotal <= coverage.elementLimit) {
+        throw evidenceError('the fixture did not exceed the element limit, so nothing here is under test', ctx.lastDiag);
+      }
+      if (fixture.fillerCount !== EXPECTED.coverage.fillerCount) {
+        throw evidenceError(`the fixture built ${fixture.fillerCount} filler elements, expected ${EXPECTED.coverage.fillerCount}`, ctx.lastDiag);
+      }
+      if (coverage.complete !== false) throw evidenceError('a page walked in part reported a complete scan', ctx.lastDiag);
+      if (!coverage.warning || !/INCOMPLETE/.test(coverage.warning)) {
+        throw evidenceError('a truncated scan came back without a warning saying so', ctx.lastDiag);
+      }
+      expect(coverage.elementsScanned, coverage.elementLimit, 'elements inspected before the cap');
+
+      const srcs = data.candidates.map(c => c.src);
+      if (!srcs.some(s => s.endsWith(EXPECTED.coverage.early))) {
+        throw evidenceError('the background BEFORE the cap was missed as well - this is a broken walk, not a truncated one', ctx.lastDiag);
+      }
+      if (srcs.some(s => s.endsWith(EXPECTED.coverage.late))) {
+        throw evidenceError('the background PAST the cap was collected, so the limit never fired and the warning is a lie', ctx.lastDiag);
+      }
+      if (!srcs.some(s => s.endsWith(EXPECTED.coverage.lateImg))) {
+        throw evidenceError('an <img> past the element limit was dropped: the cap is on the CSS walk only, document.images is never truncated', ctx.lastDiag);
+      }
+
+      const before = await completedCount();
+      const bulk = await bulkWith(tabId, null);
+      ctx.lastDiag = { fixture, bulk };
+      expect(bulk.scanComplete, false, 'scanComplete on a bulk run over a truncated page');
+      if (!bulk.scanWarning || !/INCOMPLETE/.test(bulk.scanWarning)) {
+        throw evidenceError('the bulk result carried no warning about the partial scan', ctx.lastDiag);
+      }
+      expect(bulk.found, EXPECTED.coverage.uniqueImages, 'images found');
+      expect(bulk.planned, EXPECTED.coverage.uniqueImages, 'images queued');
+
+      await waitFor(`${bulk.planned} downloads from the truncated page to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + bulk.planned;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + bulk.planned, bulk.ids) });
+      const written = await expectFilesOnDisk(bulk.ids, bulk.planned, 'truncated-page bulk');
+
+      // What a menu user sees. The files landed, but this was not a clean sweep and
+      // the badge is the only place that can say so.
+      const badge = await swEval(() => chrome.action.getBadgeText({}));
+      if (badge !== `${bulk.downloaded}?`) {
+        throw evidenceError(`the badge reads ${badge}, expected ${bulk.downloaded}? - a page we only partly inspected must not look like a clean sweep`, { badge, scanWarning: bulk.scanWarning });
+      }
+
+      await openPopup(tabId);
+      const note = await ctx.popup.evaluate(() => {
+        const el = document.getElementById('scanNote');
+        return { hidden: el.hidden, warn: el.classList.contains('warn'), text: el.textContent };
+      });
+      if (note.hidden || !note.warn || !/INCOMPLETE/.test(note.text)) {
+        throw evidenceError('the popup never warned that the page was only partly inspected', note);
+      }
+      return `${coverage.elementsScanned} of ${coverage.elementsTotal} elements walked; ${written.count} files landed (${written.bytes}B), badge ${badge}, banner: "${note.text}"`;
+    }
+  },
+  {
     title: 'the page context menu is registered with chrome and its click handler is attached',
     critical: true,
     run: async () => {
@@ -559,6 +694,8 @@ const steps = [
       expect(data.failed, 0, 'failed downloads on a healthy page');
       // No scrolling was asked for, so there is no end to confirm either way.
       if (data.scroll !== null) throw evidenceError('a bulk run without auto-scroll reported a scroll summary', data.scroll);
+      // This page is small: the collector saw all of it and must say so.
+      expect(data.scanComplete, true, 'scanComplete on a page inside the element limit');
 
       await waitFor(`${EXPECTED.bulkDownloads} menu-triggered downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
