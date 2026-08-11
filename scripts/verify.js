@@ -9,15 +9,25 @@ import { Report } from './lib/report.js';
 import { encodePng, decodePng, countDistinctColors } from './lib/png.js';
 import { planDownloads, DOWNLOAD_FOLDER } from '../src/core/images.js';
 import { SCROLL_OUTCOME, initScrollRun, observeScroll, scrollSummary } from '../src/core/scroll.js';
+import {
+  MAX_SAFE_BACKOFF_MS,
+  WORKER_IDLE_SHUTDOWN_MS,
+  mergeRetryOptions,
+  classifyFailure,
+  backoffSchedule,
+  worstCaseItemMs,
+  runDownloads
+} from '../src/core/retry.js';
+import { EXPECTED } from '../test/fixtures/expected.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const UNIT_DIR = path.join(ROOT, 'test', 'unit');
 // Guards against the classic false green: a runner that finds nothing still exits 0.
-// Today: 36 tests across 6 files. Keep a little slack, not a lot - the point is to
+// Today: 48 tests across 7 files. Keep a little slack, not a lot - the point is to
 // notice when a file stops being discovered.
-const MIN_UNIT_FILES = 6;
-const MIN_UNIT_TESTS = 32;
+const MIN_UNIT_FILES = 7;
+const MIN_UNIT_TESTS = 42;
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -178,6 +188,66 @@ report.check('the scroll state machine tells a confirmed bottom apart from givin
   return `${cases.length} outcomes correct; only ${SCROLL_OUTCOME.SETTLED}/${SCROLL_OUTCOME.IMAGE_CAP} report reachedEnd, both safety nets warn`;
 });
 
+// Retrying the wrong things is worse than not retrying: it turns a clear 404 into
+// three of them and a cancelled download into a fight with the user.
+report.check('failure reasons split into retryable and permanent, and an unknown reason is never retried', () => {
+  const retryable = ['SERVER_FAILED', 'SERVER_UNREACHABLE', 'SERVER_CONTENT_LENGTH_MISMATCH', 'NETWORK_FAILED', 'NETWORK_TIMEOUT', 'NETWORK_DISCONNECTED', 'FILE_TRANSIENT_ERROR', 'CRASH', 'DOWNLOAD_TIMEOUT'];
+  const permanent = ['USER_CANCELED', 'USER_SHUTDOWN', 'SERVER_BAD_CONTENT', 'SERVER_FORBIDDEN', 'SERVER_UNAUTHORIZED', 'NETWORK_INVALID_REQUEST', 'FILE_ACCESS_DENIED', 'FILE_NO_SPACE', 'FILE_VIRUS_INFECTED'];
+  // Non-vacuity: two empty lists would satisfy every loop below.
+  if (retryable.length < 3 || permanent.length < 3) throw fail('one of the reason buckets is too small to prove anything', JSON.stringify({ retryable, permanent }));
+  const wrong = [];
+  for (const reason of retryable) {
+    const verdict = classifyFailure(reason);
+    if (!verdict.retryable || !verdict.known) wrong.push(`${reason}: expected a known transient failure, got ${JSON.stringify(verdict)}`);
+  }
+  for (const reason of permanent) {
+    const verdict = classifyFailure(reason);
+    if (verdict.retryable || !verdict.known) wrong.push(`${reason}: expected a known final answer, got ${JSON.stringify(verdict)}`);
+  }
+  const unknown = classifyFailure('WAT_JUST_HAPPENED');
+  if (unknown.retryable || unknown.known) wrong.push(`an unclassified reason must be reported as unknown and NOT retried, got ${JSON.stringify(unknown)}`);
+  const missing = classifyFailure(null);
+  if (missing.retryable || missing.code !== 'UNKNOWN') wrong.push(`a missing reason must not be retried, got ${JSON.stringify(missing)}`);
+  if (wrong.length) throw fail(`${wrong.length} reason(s) classified wrongly`, wrong.join('\n'));
+  return `${retryable.length} transient + ${permanent.length} final reasons classified; unknown and missing both default to permanent`;
+});
+
+// The retry parameters are a group, not five independent knobs. This is the check
+// that makes the coupled-parameters block in AGENTS.md enforceable instead of
+// aspirational.
+report.check('the retry budgets line up with each other and with the browser gate', () => {
+  const options = mergeRetryOptions(null);
+  const schedule = backoffSchedule(options);
+  const worstItem = worstCaseItemMs(options);
+  const problems = [];
+
+  if (options.maxAttempts < 3) problems.push(`maxAttempts=${options.maxAttempts} leaves at most one wait, so nothing can demonstrate growth`);
+  if (schedule.length !== options.maxAttempts - 1) problems.push(`the schedule has ${schedule.length} waits for ${options.maxAttempts} attempts`);
+  for (let i = 1; i < schedule.length; i += 1) {
+    if (schedule[i] <= schedule[i - 1] && schedule[i] < options.backoffMaxMs) {
+      problems.push(`wait ${i + 1} (${schedule[i]}ms) does not grow past wait ${i} (${schedule[i - 1]}ms) and is not at the ${options.backoffMaxMs}ms cap`);
+    }
+  }
+  const longest = schedule.length ? Math.max(...schedule) : 0;
+  if (longest > MAX_SAFE_BACKOFF_MS) {
+    problems.push(`the longest wait is ${longest}ms, past the ${MAX_SAFE_BACKOFF_MS}ms ceiling that keeps a bare sleep well inside the worker's ~${WORKER_IDLE_SHUTDOWN_MS}ms idle shutdown`);
+  }
+  if (worstItem >= EXPECTED.downloads.gateTimeoutMs) {
+    problems.push(`one worst-case file takes ${worstItem}ms, at or past the browser gate's ${EXPECTED.downloads.gateTimeoutMs}ms download wait - a bad file would time the gate out instead of failing it`);
+  }
+  if (options.runTimeoutMs < worstItem * 2) {
+    problems.push(`runTimeoutMs ${options.runTimeoutMs}ms cannot cover two worst-case files (${worstItem}ms each), so a normal run would start reporting files as skipped`);
+  }
+  if (EXPECTED.downloads.flakyFailures >= options.maxAttempts) {
+    problems.push(`the flaky fixture fails ${EXPECTED.downloads.flakyFailures}x against maxAttempts=${options.maxAttempts}: the browser gate would be asserting a give-up, not a retry`);
+  }
+  if (EXPECTED.downloads.flakyAttempts !== EXPECTED.downloads.flakyFailures + 1) {
+    problems.push(`flakyAttempts (${EXPECTED.downloads.flakyAttempts}) should be flakyFailures + 1 (${EXPECTED.downloads.flakyFailures + 1})`);
+  }
+  if (problems.length) throw fail(`${problems.length} retry budget(s) do not line up`, problems.join('\n'));
+  return `${options.maxAttempts} attempts, waits ${schedule.join('+')}ms (cap ${options.backoffMaxMs}), worst file ${worstItem}ms < gate ${EXPECTED.downloads.gateTimeoutMs}ms, run budget ${options.runTimeoutMs}ms`;
+});
+
 report.check('png codec round-trips (the gate\'s own screenshot tooling)', () => {
   const png = encodePng(8, 8, (x, y) => [x * 30, y * 30, (x + y) * 15, 255]);
   const decoded = decodePng(png);
@@ -207,6 +277,46 @@ report.check('unit tests are discovered, actually execute and all pass', () => {
   if (tests < MIN_UNIT_TESTS) throw fail(`only ${tests} tests executed, expected at least ${MIN_UNIT_TESTS}`, tail(out));
   if (failed !== 0 || res.status !== 0) throw fail(`${failed} of ${tests} unit tests failed (exit ${res.status})`, tail(out, 120));
   return `${passed}/${tests} unit tests passed across ${files.length} files`;
+});
+
+// The one thing about a backoff that has to be PROVEN rather than read: that it was
+// actually awaited. The clock below only moves when the driver asks to wait, so a
+// driver that computed the delays and skipped them would produce an empty wait log
+// and every attempt would land on the same instant.
+await report.checkAsync('the retry driver really awaits its backoff, in order, for growing durations', async () => {
+  const options = mergeRetryOptions({ maxAttempts: 4, backoffBaseMs: 100, backoffFactor: 3, backoffMaxMs: 5000 });
+  const log = [];
+  let clock = 0;
+  const result = await runDownloads({
+    items: [{ url: 'https://example.test/a.png', filename: 'image-grabber/img-001-a.png' }],
+    options,
+    now: () => clock,
+    wait: async ms => { log.push(`wait:${ms}`); clock += ms; },
+    start: async (record, context) => {
+      log.push(`attempt:${context.attempt}@${clock}`);
+      clock += 10;
+      return context.attempt < 4
+        ? { ok: false, reason: 'SERVER_FAILED' }
+        : { ok: true, id: 7, filename: '/tmp/a.png', bytes: 128 };
+    }
+  });
+  const expectedLog = ['attempt:1@0', 'wait:100', 'attempt:2@110', 'wait:300', 'attempt:3@420', 'wait:900', 'attempt:4@1330'];
+  if (log.join(' | ') !== expectedLog.join(' | ')) {
+    throw fail('the attempt/wait interleaving is wrong - the backoff was skipped, reordered or the wrong length', `expected: ${expectedLog.join(' | ')}\nactual:   ${log.join(' | ')}`);
+  }
+  const attempts = result.items[0].attempts;
+  const waited = attempts.map(a => a.waitedMs);
+  if (waited.join(',') !== '0,100,300,900') {
+    throw fail(`recorded waits are ${waited.join(',')}, expected 0,100,300,900`, JSON.stringify(attempts, null, 2));
+  }
+  const gaps = attempts.slice(1).map((a, i) => a.startedAt - attempts[i].endedAt);
+  if (gaps.join(',') !== '100,300,900') {
+    throw fail(`the clock moved by ${gaps.join(',')}ms between attempts, expected 100,300,900`, JSON.stringify(attempts, null, 2));
+  }
+  if (result.done !== 1 || result.retries !== 3 || result.attempts !== 4) {
+    throw fail(`the run reported done=${result.done} retries=${result.retries} attempts=${result.attempts}, expected 1/3/4`, JSON.stringify(result, null, 2));
+  }
+  return `4 attempts interleaved with waits of ${waited.slice(1).join('/')}ms on a clock the driver does not own`;
 });
 
 report.save(ARTIFACTS, 'fast');
