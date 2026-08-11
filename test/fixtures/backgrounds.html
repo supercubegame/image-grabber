@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Grabber fixture: css backgrounds</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .box { width: 120px; height: 90px; }
+  /* An ordinary element background - collected since the first version. */
+  .plain { background-image: url('img/210x160.png'); }
+  /* GENERATED pseudo-elements. getComputedStyle(el) cannot see either of these,
+     so before this fixture existed both were invisible to the scan. */
+  .pseudo::before { content: ''; display: block; width: 40px; height: 30px; background-image: url('img/220x170.png'); }
+  .pseudo::after { content: ''; display: block; width: 40px; height: 30px; background-image: url("img/230x180.png"); }
+  /* NOT generated: no `content`, so this box never exists and its background is
+     nowhere on screen. Chrome still answers with a computed style for it, which is
+     why the collector checks `content` - and why the gate asserts this url is
+     ABSENT. Without that half, "we found the ::before images" also passes for a
+     collector that scoops up every computed style it can reach. */
+  .ghost::before { background-image: url('img/240x190.png'); }
+  /* The parser case. A quoted url whose filename contains brackets: the old regex
+     /url\((['"]?)([^'")]+)\1\)/g stopped at the first ")" and then failed to match
+     the closing quote, so this image was dropped silently. */
+  .parens { background-image: url("img/250x200(2).png"); }
+  /* Two images in one declaration. The padding and the missing quotes are
+     normalised away by getComputedStyle - only parseCssUrls' unit tests see those
+     shapes - but the LAYERING survives, and one value must yield two candidates. */
+  .multi { background-image: url( img/260x210.png ), url('img/270x220.png'); }
+</style>
+</head>
+<body>
+<h1>css backgrounds</h1>
+<!--
+  Counts are asserted from EXPECTED.backgrounds - recompute both together.
+  1 <img> + 6 collectable css urls = 7 unique images; .ghost's url is the 7th css
+  reference on the page and must never appear.
+-->
+<img src="img/200x150.png" alt="an ordinary img">
+<div class="box plain"></div>
+<div class="box pseudo"></div>
+<div class="box ghost"></div>
+<div class="box parens"></div>
+<div class="box multi"></div>
+</body>
+</html>

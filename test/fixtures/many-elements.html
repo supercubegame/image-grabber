@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Grabber fixture: more elements than the collector inspects</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .filler { width: 1px; height: 1px; }
+  .early { width: 40px; height: 30px; background-image: url('img/280x230.png'); }
+  .late { width: 40px; height: 30px; background-image: url('img/290x240.png'); }
+</style>
+</head>
+<body>
+<h1>too many elements</h1>
+<!--
+  FILLER_COUNT below must stay above SCAN_ELEMENT_LIMIT (4000) in
+  src/core/images.js, or this page is inspected in full and the truncation check
+  passes against a complete scan while proving nothing. The fast gate compares the
+  two numbers and the browser gate asserts elementsTotal > elementLimit before it
+  believes anything else here.
+
+  Document order matters: .early is before the filler, .late is after it, and the
+  trailing <img> is there to prove the cap applies to the ELEMENT WALK only -
+  document.images is never truncated.
+-->
+<div class="early"></div>
+<div id="filler"></div>
+<div class="late"></div>
+<img src="img/300x250.png" alt="an img past the element limit">
+<script>
+  const FILLER_COUNT = 4200;
+  const host = document.getElementById('filler');
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < FILLER_COUNT; i += 1) {
+    const div = document.createElement('div');
+    div.className = 'filler';
+    frag.append(div);
+  }
+  host.append(frag);
+  // Read by the gate: if the filler never built, the counts below say so instead
+  // of the run quietly asserting truncation against a small page.
+  window.__FIXTURE__ = { fillerCount: FILLER_COUNT, elements: document.querySelectorAll('*').length };
+</script>
+</body>
+</html>
