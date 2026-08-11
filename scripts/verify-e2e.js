@@ -22,15 +22,25 @@ const POLL_INTERVAL_MS = 250;
 const DOWNLOAD_TIMEOUT_MS = 40000;
 const LAUNCH_TIMEOUT_MS = 60000;
 
+// Auto-scroll option sets. Coupled to the fixture batch maths in expected.js:
+// scroll-finite.html needs 3 scrolls to load its batches plus 3 more to confirm the
+// end, so maxScrolls has to stay comfortably above 6 here or the finite page would
+// fail for hitting a cap this test never meant to exercise.
+// settleMs 500 vs the fixtures' 120ms load delay keeps ~4x margin on a slow runner.
+const GATE_SCROLL = { enabled: true, stableRounds: 3, maxScrolls: 12, timeoutMs: 45000, settleMs: 500, maxImages: 0 };
+const ENDLESS_SCROLL = { ...GATE_SCROLL, maxScrolls: 6 };
+const TIMEOUT_SCROLL = { enabled: true, stableRounds: 3, maxScrolls: 200, timeoutMs: 1500, settleMs: 200, maxImages: 0 };
+const CAP_SCROLL = { ...GATE_SCROLL, maxScrolls: 20, maxImages: EXPECTED.scroll.imageCap };
+
 const report = new Report('browser gate');
-const ctx = { errors: [], screenshots: {}, lastDiag: null };
+const ctx = { errors: [], screenshots: {}, lastDiag: null, navigations: 0 };
 
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Predicates MUST return a real boolean. Returning a count means 0 reads as "not
-// ready yet" and the failure surfaces as a timeout instead of a wrong value.
+// Predicates MUST return a real boolean. Returning a count means 0 reads as 'not
+// ready yet' and the failure surfaces as a timeout instead of a wrong value.
 async function waitFor(label, predicate, { timeout = POLL_TIMEOUT_MS, snapshot = null } = {}) {
   const deadline = Date.now() + timeout;
   let lastError = null;
@@ -95,13 +105,59 @@ async function swEval(fn, ...args) {
 
 const diag = (page = ctx.popup) => page.evaluate(() => (window.__DIAG__ ? window.__DIAG__.state : null));
 
+async function resolveTabId(url) {
+  return swEval(async (u) => {
+    const tabs = await chrome.tabs.query({});
+    const hit = tabs.find(t => t.url === u);
+    return hit ? hit.id : -1;
+  }, url);
+}
+
+// Every load gets a fresh ?run= so the browser cannot restore the previous scroll
+// position or reuse a warm document. A scroll test that starts half way down the
+// page passes for the wrong reason.
+async function loadFixture(tab) {
+  ctx.navigations += 1;
+  tab.url = `${ctx.server.origin}/${tab.name}?run=${ctx.navigations}`;
+  await tab.page.goto(tab.url, { waitUntil: 'networkidle2', timeout: 30000 });
+  tab.tabId = await resolveTabId(tab.url);
+  if (tab.tabId < 0) throw evidenceError(`the extension could not find the tab for ${tab.name}`, tab.url);
+  return tab;
+}
+
+async function openFixtureTab(name, label) {
+  const page = await ctx.browser.newPage();
+  watch(page, label);
+  return loadFixture({ name, label, page, url: null, tabId: -1 });
+}
+
+async function scanWith(tabId, scroll) {
+  const response = await ctx.popup.evaluate(
+    (id, options) => chrome.runtime.sendMessage({ type: 'scan', tabId: id, scroll: options }),
+    tabId,
+    scroll || null
+  );
+  if (!response || !response.ok) throw evidenceError('the scan request failed', response);
+  return response.data;
+}
+
+async function bulkWith(tabId, scroll) {
+  const response = await ctx.popup.evaluate(
+    (id, options) => chrome.runtime.sendMessage({ type: 'bulk-download', tabId: id, scroll: options }),
+    tabId,
+    scroll || null
+  );
+  if (!response || !response.ok) throw evidenceError('the bulk download request failed', response);
+  return response.data;
+}
+
 async function openPopup(tabId) {
   const target = tabId === undefined ? ctx.tabId : tabId;
   await ctx.popup.goto(`chrome-extension://${ctx.extId}/src/popup/popup.html?tabId=${target}`, {
     waitUntil: 'domcontentloaded',
     timeout: 30000
   });
-  await waitFor('popup phase to reach "ready"', async () => {
+  await waitFor('popup phase to reach ready', async () => {
     const state = await diag();
     ctx.lastDiag = state;
     return state !== null && state.phase === 'ready';
@@ -133,6 +189,25 @@ async function shoot(name) {
 
 function describeDownloads(items) {
   return (items || []).map(i => ({ id: i.id, filename: i.filename, state: i.state, bytes: i.bytesReceived, error: i.error }));
+}
+
+// Shared by the bulk-download checks: complete downloads that are not on disk are
+// the whole reason this gate looks at the filesystem instead of trusting the API.
+async function expectFilesOnDisk(ids, expectedCount, label) {
+  const mine = (ctx.downloads || []).filter(i => ids.includes(i.id) && i.state === 'complete');
+  if (mine.length !== expectedCount) {
+    throw evidenceError(`${mine.length} of ${expectedCount} ${label} downloads completed`, describeDownloads((ctx.downloads || []).filter(i => ids.includes(i.id))));
+  }
+  const onDisk = mine.filter(i => i.filename && fs.existsSync(i.filename) && fs.statSync(i.filename).size > 0);
+  if (onDisk.length !== mine.length) {
+    throw evidenceError('chrome reported complete downloads that are not on disk', describeDownloads(mine));
+  }
+  const folders = new Set(onDisk.map(i => path.basename(path.dirname(i.filename))));
+  if (folders.size !== 1 || !folders.has('image-grabber')) {
+    throw evidenceError(`${label} downloads did not all land in the image-grabber folder`, onDisk.map(i => i.filename).join('\n'));
+  }
+  const bytes = onDisk.reduce((sum, i) => sum + fs.statSync(i.filename).size, 0);
+  return { count: onDisk.length, bytes };
 }
 
 const steps = [
@@ -172,7 +247,7 @@ const steps = [
         diag: typeof self.__DIAG__
       }));
       if (info.diag !== 'object') throw new Error('service worker exposes no __DIAG__ object');
-      return `"${info.name}" v${info.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}`;
+      return `${info.name} v${info.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}`;
     }
   },
   {
@@ -186,13 +261,9 @@ const steps = [
       if (!res || !res.ok()) throw new Error(`fixture page returned ${res ? res.status() : 'no response'}`);
       const imgCount = await ctx.page.evaluate(() => document.images.length);
       if (imgCount !== EXPECTED.imgElements) throw new Error(`fixture has ${imgCount} <img> elements, expected ${EXPECTED.imgElements}`);
-      ctx.tabId = await swEval(async (url) => {
-        const tabs = await chrome.tabs.query({});
-        const hit = tabs.find(t => t.url === url);
-        return hit ? hit.id : -1;
-      }, ctx.pageUrl);
+      ctx.tabId = await resolveTabId(ctx.pageUrl);
       if (ctx.tabId < 0) throw new Error('the extension could not find the fixture tab');
-      return `tab ${ctx.tabId} serving ${imgCount} <img> elements`;
+      return `tab ${ctx.tabId} serving ${imgCount} img elements`;
     }
   },
   {
@@ -357,11 +428,7 @@ const steps = [
       const page = await ctx.browser.newPage();
       watch(page, 'second fixture page');
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-      const tabId = await swEval(async (u) => {
-        const tabs = await chrome.tabs.query({});
-        const hit = tabs.find(t => t.url === u);
-        return hit ? hit.id : -1;
-      }, url);
+      const tabId = await resolveTabId(url);
       if (tabId < 0) throw new Error('could not resolve the second tab');
       await openPopup(tabId);
       const state = await diag();
@@ -389,10 +456,10 @@ const steps = [
       }, { snapshot: () => ctx.menu });
       if (ctx.menu.error) throw evidenceError('chrome rejected the context menu: ' + ctx.menu.error, ctx.menu);
       if (!ctx.menu.created) throw evidenceError('the context menu was never created', ctx.menu);
-      if (ctx.menu.id !== EXPECTED.contextMenuId) throw evidenceError(`menu id is "${ctx.menu.id}", expected "${EXPECTED.contextMenuId}"`, ctx.menu);
+      if (ctx.menu.id !== EXPECTED.contextMenuId) throw evidenceError(`menu id is ${ctx.menu.id}, expected ${EXPECTED.contextMenuId}`, ctx.menu);
       // A menu item nobody listens to looks perfectly healthy and does nothing.
       if (!ctx.menu.listenerAttached) throw evidenceError('nothing is listening on contextMenus.onClicked - the item would be inert', ctx.menu);
-      return `menu "${ctx.menu.id}" accepted by chrome, onClicked handler attached`;
+      return `menu ${ctx.menu.id} accepted by chrome, onClicked handler attached`;
     }
   },
   {
@@ -406,49 +473,210 @@ const steps = [
       // - it reads the stored settings - so reset them and expect the whole page.
       await swEval(() => chrome.storage.local.remove('settings'));
       const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
-      const response = await ctx.popup.evaluate(
-        tabId => chrome.runtime.sendMessage({ type: 'bulk-download', tabId }),
-        ctx.tabId
-      );
-      if (!response || !response.ok) throw evidenceError('the bulk download request failed', response);
-      const data = response.data;
+      const data = await bulkWith(ctx.tabId, null);
       ctx.lastDiag = data;
       expect(data.found, EXPECTED.uniqueImages, 'images found by the menu-triggered scan');
       expect(data.planned, EXPECTED.bulkDownloads, 'images queued in one click');
       expect(data.skipped, EXPECTED.bulkSkipped, 'images skipped by the stored filters');
+      // No scrolling was asked for, so there is no end to confirm either way.
+      if (data.scroll !== null) throw evidenceError('a bulk run without auto-scroll reported a scroll summary', data.scroll);
 
       await waitFor(`${EXPECTED.bulkDownloads} menu-triggered downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.bulkDownloads;
       }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
 
-      const mine = (ctx.downloads || []).filter(i => data.ids.includes(i.id) && i.state === 'complete');
-      if (mine.length !== EXPECTED.bulkDownloads) {
-        throw evidenceError(`${mine.length} of ${EXPECTED.bulkDownloads} queued downloads completed`, describeDownloads((ctx.downloads || []).filter(i => data.ids.includes(i.id))));
-      }
-      const onDisk = mine.filter(i => i.filename && fs.existsSync(i.filename) && fs.statSync(i.filename).size > 0);
-      if (onDisk.length !== mine.length) {
-        throw evidenceError('chrome reported complete downloads that are not on disk', describeDownloads(mine));
-      }
-      const names = onDisk.map(i => path.basename(i.filename));
-      const folders = new Set(onDisk.map(i => path.basename(path.dirname(i.filename))));
-      if (folders.size !== 1 || !folders.has('image-grabber')) {
-        throw evidenceError('menu downloads did not all land in the image-grabber folder', onDisk.map(i => i.filename).join('\n'));
-      }
+      const written = await expectFilesOnDisk(data.ids, EXPECTED.bulkDownloads, 'menu');
+      const names = (ctx.downloads || []).filter(i => data.ids.includes(i.id)).map(i => path.basename(i.filename || ''));
       const stray = names.find(n => !/^img-\d{3}-/.test(n));
-      if (stray) throw evidenceError(`"${stray}" is not a generated name - chrome named this one itself`, names.join('\n'));
+      if (stray) throw evidenceError(`${stray} is not a generated name - chrome named this one itself`, names.join('\n'));
       if (names.some(n => n.includes('inline'))) throw evidenceError('the inline data: url was downloaded despite being filtered out', names.join('\n'));
 
       const badge = await swEval(() => chrome.action.getBadgeText({}));
       if (badge !== String(EXPECTED.bulkDownloads)) {
-        throw evidenceError(`the toolbar badge reads "${badge}", expected "${EXPECTED.bulkDownloads}" - the only feedback this action gives`, { badge });
+        throw evidenceError(`the toolbar badge reads ${badge}, expected ${EXPECTED.bulkDownloads} - the only feedback this action gives`, { badge });
       }
       const bulk = await swEval(() => ({ runs: self.__DIAG__.bulkRuns, last: self.__DIAG__.lastBulk }));
       if (!bulk.last || bulk.runs < 1) throw evidenceError('the worker recorded no bulk run', bulk);
-      expect(bulk.last.planned, EXPECTED.bulkDownloads, '__DIAG__.lastBulk.planned');
+      expect(bulk.last.planned, EXPECTED.bulkDownloads, 'DIAG.lastBulk.planned');
 
-      const bytes = onDisk.reduce((sum, i) => sum + fs.statSync(i.filename).size, 0);
-      return `one action -> ${onDisk.length} files, ${bytes}B total: ${names.join(', ')}; badge "${badge}"`;
+      return `one action -> ${written.count} files, ${written.bytes}B total: ${names.join(', ')}; badge ${badge}`;
+    }
+  },
+  {
+    title: 'auto-scroll pulls in images that a plain scan never sees',
+    critical: true,
+    run: async () => {
+      ctx.finite = await openFixtureTab('scroll-finite.html', 'finite lazy fixture');
+      const plain = await scanWith(ctx.finite.tabId, null);
+      if (plain.scroll !== null) throw evidenceError('a scan with scrolling disabled still reported a scroll run', plain.scroll);
+      expect(plain.candidates.length, EXPECTED.scroll.finiteInitialImages, 'images reachable without scrolling');
+
+      const scrolled = await scanWith(ctx.finite.tabId, GATE_SCROLL);
+      const summary = scrolled.scroll;
+      ctx.lastDiag = summary;
+      if (!summary) throw evidenceError('scrolling was requested but no scroll summary came back', scrolled);
+      expect(scrolled.candidates.length, EXPECTED.scroll.finiteTotalImages, 'images after auto-scroll');
+      expect(summary.outcome, 'settled', 'scroll outcome on a page that ends');
+      expect(summary.reachedEnd, true, 'reachedEnd');
+      expect(summary.stableRounds, GATE_SCROLL.stableRounds, 'consecutive unchanged rounds at the verdict');
+      expect(summary.growthRounds, EXPECTED.scroll.finiteGrowthRounds, 'rounds in which new images arrived');
+      if (summary.warning !== null) throw evidenceError('a confirmed end still carried a warning', summary);
+      // The one comparison that can only hold if the feature does something.
+      if (scrolled.candidates.length <= plain.candidates.length) {
+        throw evidenceError('auto-scroll found no more images than a plain scan', { plain: plain.candidates.length, scrolled: scrolled.candidates.length, summary });
+      }
+      return `${plain.candidates.length} -> ${scrolled.candidates.length} images in ${summary.scrolls} scrolls, settled after ${summary.stableRounds} unchanged rounds`;
+    }
+  },
+  {
+    title: 'a page that never ends stops at the scroll cap and reports the end as not confirmed',
+    run: async () => {
+      ctx.endless = await openFixtureTab('scroll-endless.html', 'endless lazy fixture');
+      const data = await scanWith(ctx.endless.tabId, ENDLESS_SCROLL);
+      const summary = data.scroll;
+      ctx.lastDiag = summary;
+      expect(summary.outcome, 'max-scrolls', 'scroll outcome on a page with no bottom');
+      expect(summary.reachedEnd, false, 'reachedEnd');
+      expect(summary.scrolls, ENDLESS_SCROLL.maxScrolls, 'scrolls performed before giving up');
+      if (!summary.warning || !/NOT confirmed/.test(summary.warning)) {
+        throw evidenceError('a run that gave up came back without a warning saying so', summary);
+      }
+      // Giving up is not the same as returning nothing: it still hands back what it
+      // did see.
+      if (data.candidates.length < EXPECTED.scroll.endlessMinImages) {
+        throw evidenceError(`only ${data.candidates.length} images collected before the cap, expected at least ${EXPECTED.scroll.endlessMinImages}`, summary);
+      }
+      return `gave up after ${summary.scrolls} scrolls with ${data.candidates.length} images - ${summary.warning}`;
+    }
+  },
+  {
+    title: 'the total timeout also ends an endless page as not confirmed, and ends it promptly',
+    run: async () => {
+      await loadFixture(ctx.endless);
+      const data = await scanWith(ctx.endless.tabId, TIMEOUT_SCROLL);
+      const summary = data.scroll;
+      ctx.lastDiag = summary;
+      expect(summary.outcome, 'timeout', 'scroll outcome when the clock runs out first');
+      expect(summary.reachedEnd, false, 'reachedEnd');
+      if (summary.elapsedMs < TIMEOUT_SCROLL.timeoutMs) {
+        throw evidenceError(`the timeout fired at ${summary.elapsedMs}ms, before its own ${TIMEOUT_SCROLL.timeoutMs}ms deadline`, summary);
+      }
+      // Only here to catch a timeout that never actually stops anything. The ceiling
+      // keeps ~10x margin over the deadline; it is not a performance budget.
+      if (summary.elapsedMs > EXPECTED.scroll.timeoutCeilingMs) {
+        throw evidenceError(`the run kept going for ${summary.elapsedMs}ms, long past its ${TIMEOUT_SCROLL.timeoutMs}ms timeout`, summary);
+      }
+      return `stopped at ${summary.elapsedMs}ms (deadline ${TIMEOUT_SCROLL.timeoutMs}ms) after ${summary.scrolls} scrolls, end not confirmed`;
+    }
+  },
+  {
+    title: 'a page whose loader dies half-way returns exactly the images that arrived',
+    run: async () => {
+      ctx.broken = await openFixtureTab('scroll-broken.html', 'half-broken lazy fixture');
+      const data = await scanWith(ctx.broken.tabId, GATE_SCROLL);
+      const summary = data.scroll;
+      ctx.lastDiag = summary;
+      // Without this the check is meaningless: a fixture that quietly finished on its
+      // own would produce identical numbers and prove nothing about a failure.
+      const fixture = await ctx.broken.page.evaluate(() => window.__FIXTURE__);
+      if (fixture.failed !== true || fixture.batches !== 1) {
+        throw evidenceError('the fixture never actually failed, so this check proves nothing', fixture);
+      }
+      expect(data.candidates.length, EXPECTED.scroll.brokenTotalImages, 'images collected from a page that broke');
+      expect(summary.growthRounds, EXPECTED.scroll.brokenGrowthRounds, 'rounds in which new images arrived');
+      // Documented blind spot: a page that stops growing is indistinguishable from a
+      // page that has ended, so this reports a confirmed end. See AGENTS.md.
+      expect(summary.outcome, 'settled', 'scroll outcome on a page that broke and then stopped changing');
+      expect(summary.reachedEnd, true, 'reachedEnd');
+      return `loader died after ${fixture.batches} batch: ${data.candidates.length} images, ${summary.growthRounds} growth round, settled in ${summary.scrolls} scrolls`;
+    }
+  },
+  {
+    title: 'the optional image cap ends a run through the normal path, not the safety net',
+    run: async () => {
+      await loadFixture(ctx.endless);
+      const data = await scanWith(ctx.endless.tabId, CAP_SCROLL);
+      const summary = data.scroll;
+      ctx.lastDiag = summary;
+      expect(summary.outcome, 'image-cap', 'scroll outcome when the cap is reached');
+      expect(summary.reachedEnd, true, 'reachedEnd');
+      if (summary.warning !== null) throw evidenceError('stopping at the requested count is not a failure and must not warn', summary);
+      if (summary.imagesAtEnd < EXPECTED.scroll.imageCap) {
+        throw evidenceError(`stopped at ${summary.imagesAtEnd} images, below the ${EXPECTED.scroll.imageCap} that were asked for`, summary);
+      }
+      // If it had run all the way to the scroll cap as well, the outcome above would
+      // be a coincidence rather than proof the image cap did anything.
+      if (summary.scrolls >= CAP_SCROLL.maxScrolls) {
+        throw evidenceError('the run reached the scroll cap too, so the image cap proves nothing here', summary);
+      }
+      return `stopped at ${summary.imagesAtEnd} images after ${summary.scrolls} scrolls (cap ${EXPECTED.scroll.imageCap}, scroll cap ${CAP_SCROLL.maxScrolls} untouched)`;
+    }
+  },
+  {
+    title: 'the scrolling menu item is wired and its bulk run downloads the whole lazy page',
+    run: async () => {
+      const menu = await swEval(() => {
+        const m = self.__DIAG__.contextMenuScroll;
+        return m ? { id: m.id, created: m.created, error: m.error, listenerAttached: m.listenerAttached } : null;
+      });
+      if (!menu) throw new Error('the worker exposes no diagnostics for the scrolling menu item');
+      if (menu.error) throw evidenceError('chrome rejected the scrolling menu item: ' + menu.error, menu);
+      if (!menu.created) throw evidenceError('the scrolling menu item was never created', menu);
+      if (menu.id !== EXPECTED.contextMenuScrollId) throw evidenceError(`scrolling menu id is ${menu.id}, expected ${EXPECTED.contextMenuScrollId}`, menu);
+      if (!menu.listenerAttached) throw evidenceError('nothing is listening for clicks on the scrolling menu item', menu);
+
+      await swEval(() => chrome.storage.local.remove('settings'));
+      await loadFixture(ctx.finite);
+      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const data = await bulkWith(ctx.finite.tabId, GATE_SCROLL);
+      ctx.lastDiag = data;
+      expect(data.found, EXPECTED.scroll.finiteTotalImages, 'images found by the scrolling bulk run');
+      expect(data.planned, EXPECTED.scroll.finiteTotalImages, 'images queued');
+      expect(data.endConfirmed, true, 'endConfirmed');
+
+      await waitFor(`${data.planned} scrolled bulk downloads to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + data.planned;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+
+      const written = await expectFilesOnDisk(data.ids, data.planned, 'scrolled bulk');
+      const badge = await swEval(() => chrome.action.getBadgeText({}));
+      if (badge !== String(data.planned)) {
+        throw evidenceError(`the badge reads ${badge}, expected ${data.planned} with no uncertainty marker`, { badge, planned: data.planned });
+      }
+      return `menu ${menu.id} wired; one action -> ${written.count} files (${written.bytes}B) after ${data.scroll.scrolls} scrolls, badge ${badge}`;
+    }
+  },
+  {
+    title: 'a bulk run that never confirmed the end marks itself instead of passing for a clean sweep',
+    run: async () => {
+      await swEval(() => chrome.storage.local.remove('settings'));
+      await loadFixture(ctx.endless);
+      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const data = await bulkWith(ctx.endless.tabId, ENDLESS_SCROLL);
+      ctx.lastDiag = data;
+      expect(data.endConfirmed, false, 'endConfirmed on a page with no bottom');
+      if (!data.warning || !/NOT confirmed/.test(data.warning)) {
+        throw evidenceError('the bulk result carried no warning about the unconfirmed end', data);
+      }
+      if (data.planned < EXPECTED.scroll.endlessMinImages) {
+        throw evidenceError(`only ${data.planned} images queued, expected at least ${EXPECTED.scroll.endlessMinImages}`, data);
+      }
+
+      await waitFor(`${data.planned} unconfirmed bulk downloads to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + data.planned;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      const written = await expectFilesOnDisk(data.ids, data.planned, 'unconfirmed bulk');
+
+      // The badge is the only feedback a menu user gets, and 12 versus 12? mean very
+      // different things. That difference has to survive all the way out here.
+      const badge = await swEval(() => chrome.action.getBadgeText({}));
+      if (badge !== `${data.planned}?`) {
+        throw evidenceError(`the badge reads ${badge}, expected ${data.planned}? - an unconfirmed sweep must not look like a complete one`, { badge, planned: data.planned, warning: data.warning });
+      }
+      return `${written.count} files grabbed but flagged: badge ${badge}, warning: ${data.warning}`;
     }
   },
   {
