@@ -15,6 +15,11 @@ h1 { font-size: 14px; margin: 0; }
 .filters input[type="number"] { width: 62px; }
 .formats { display: flex; flex-wrap: wrap; gap: 6px; }
 .chk { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: #374151; }
+.note {
+  margin: 0; padding: 5px 12px; font-size: 11px; line-height: 1.3;
+  color: #365314; background: #f0fdf4; border-bottom: 1px solid #e5e7eb;
+}
+.note.warn { color: #7c2d12; background: #fff7ed; }
 .list { list-style: none; margin: 0; padding: 0; max-height: 430px; overflow-y: auto; }
 .row { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid #f3f4f6; }
 .thumb { width: 56px; height: 42px; object-fit: cover; background: #f3f4f6; border-radius: 3px; flex: none; }

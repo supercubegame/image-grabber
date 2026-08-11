@@ -8,15 +8,16 @@ import { fileURLToPath } from 'node:url';
 import { Report } from './lib/report.js';
 import { encodePng, decodePng, countDistinctColors } from './lib/png.js';
 import { planDownloads, DOWNLOAD_FOLDER } from '../src/core/images.js';
+import { SCROLL_OUTCOME, initScrollRun, observeScroll, scrollSummary } from '../src/core/scroll.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const UNIT_DIR = path.join(ROOT, 'test', 'unit');
 // Guards against the classic false green: a runner that finds nothing still exits 0.
-// Today: 24 tests across 5 files. Keep a little slack, not a lot - the point is to
+// Today: 36 tests across 6 files. Keep a little slack, not a lot - the point is to
 // notice when a file stops being discovered.
-const MIN_UNIT_FILES = 5;
-const MIN_UNIT_TESTS = 20;
+const MIN_UNIT_FILES = 6;
+const MIN_UNIT_TESTS = 32;
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -130,6 +131,51 @@ report.check('planDownloads keeps hostile page URLs inside the download folder',
   if (bad.length) throw fail(`${bad.length} of ${plan.length} planned paths escape or malform the download folder`, bad.map(b => b.filename).join('\n'));
   const longest = plan.reduce((max, e) => Math.max(max, e.filename.length), 0);
   return `${plan.length} hostile urls -> ${plan.length} paths, all matching ${DOWNLOAD_FOLDER}/<safe name> (longest ${longest} chars)`;
+});
+
+// The one decision auto-scroll makes. Getting it wrong in the safe direction costs
+// a few extra scrolls; getting it wrong in the other direction hands the user a
+// half-scraped page that claims to be complete, which is the failure this whole
+// feature has to avoid.
+report.check('the scroll state machine tells a confirmed bottom apart from giving up', () => {
+  const drive = (options, measurements) => {
+    let run = initScrollRun({ enabled: true, ...options });
+    let elapsed = 0;
+    for (const measurement of measurements) {
+      elapsed += 100;
+      run = observeScroll(run, measurement, elapsed);
+      if (run.done) break;
+    }
+    return scrollSummary(run);
+  };
+  const still = n => new Array(n).fill(0).map(() => ({ imageCount: 12, scrollHeight: 4800 }));
+  const growing = n => new Array(n).fill(0).map((_, i) => ({ imageCount: 12 + i * 2, scrollHeight: 4800 + i * 800 }));
+  const roomy = { stableRounds: 3, maxScrolls: 50, timeoutMs: 60000 };
+
+  const cases = [
+    { name: 'four identical rounds settle', options: roomy, feed: still(4), outcome: SCROLL_OUTCOME.SETTLED, reachedEnd: true },
+    { name: 'three identical rounds are one short', options: roomy, feed: still(3), outcome: null, reachedEnd: false },
+    { name: 'endless growth vs the scroll cap', options: { ...roomy, maxScrolls: 6 }, feed: growing(30), outcome: SCROLL_OUTCOME.MAX_SCROLLS, reachedEnd: false },
+    { name: 'endless growth vs the total timeout', options: { ...roomy, timeoutMs: 250 }, feed: growing(30), outcome: SCROLL_OUTCOME.TIMEOUT, reachedEnd: false },
+    { name: 'the optional image cap', options: { ...roomy, maxImages: 16 }, feed: growing(30), outcome: SCROLL_OUTCOME.IMAGE_CAP, reachedEnd: true }
+  ];
+
+  const wrong = [];
+  for (const scenario of cases) {
+    const summary = drive(scenario.options, scenario.feed);
+    if (summary.outcome !== scenario.outcome || summary.reachedEnd !== scenario.reachedEnd) {
+      wrong.push(`${scenario.name}: expected outcome=${scenario.outcome} reachedEnd=${scenario.reachedEnd}, got outcome=${summary.outcome} reachedEnd=${summary.reachedEnd}`);
+      continue;
+    }
+    // The user-facing pair: exactly one of "we reached the end" and "here is why we
+    // did not" may be present. Both or neither means the report lies somewhere.
+    const warned = typeof summary.warning === 'string' && summary.warning.length > 0;
+    if (warned === summary.reachedEnd) {
+      wrong.push(`${scenario.name}: reachedEnd=${summary.reachedEnd} alongside warning=${JSON.stringify(summary.warning)}`);
+    }
+  }
+  if (wrong.length) throw fail(`${wrong.length} of ${cases.length} scroll outcomes are wrong`, wrong.join('\n'));
+  return `${cases.length} outcomes correct; only ${SCROLL_OUTCOME.SETTLED}/${SCROLL_OUTCOME.IMAGE_CAP} report reachedEnd, both safety nets warn`;
 });
 
 report.check('png codec round-trips (the gate\'s own screenshot tooling)', () => {

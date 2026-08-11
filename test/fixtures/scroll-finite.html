@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Image Grabber lazy gallery (finite)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; }
+  /* Fixed heights on purpose: scrollHeight must not depend on image decoding, or
+     the stability criterion would be racing the network. */
+  .item { display: block; width: 200px; height: 400px; object-fit: contain; background: #eee; }
+  .sentinel { height: 120px; color: #888; }
+</style>
+</head>
+<body>
+<h1>lazy gallery (finite)</h1>
+<!--
+  Counts here are asserted from test/fixtures/expected.js (EXPECTED.scroll.finite*).
+  3 images on load, 3 more each time the viewport reaches the bottom, 3 batches,
+  then it stops for good: 3 + 3*3 = 12 images, every URL unique so the core has
+  nothing to dedupe.
+
+  Editing any of these numbers means recomputing expected.js.
+-->
+<div id="items"></div>
+<div class="sentinel" id="sentinel">scroll for more</div>
+<script>
+  var BATCH_SIZE = 3;
+  var MAX_BATCHES = 3;
+  var LOAD_DELAY_MS = 120;
+  var batches = 0;
+  var loading = false;
+  var served = 0;
+
+  window.__FIXTURE__ = { kind: 'finite', batches: 0, images: 0, failed: false };
+
+  function add(count) {
+    var box = document.getElementById('items');
+    for (var i = 0; i < count; i++) {
+      served++;
+      var img = document.createElement('img');
+      img.className = 'item';
+      img.src = 'img/' + (100 + served) + 'x' + (80 + served) + '.png';
+      img.alt = 'lazy ' + served;
+      box.appendChild(img);
+    }
+    window.__FIXTURE__.images = document.images.length;
+  }
+
+  function nearBottom() {
+    return window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 150;
+  }
+
+  window.addEventListener('scroll', function () {
+    if (loading || batches >= MAX_BATCHES || !nearBottom()) return;
+    loading = true;
+    setTimeout(function () {
+      batches++;
+      add(BATCH_SIZE);
+      window.__FIXTURE__.batches = batches;
+      if (batches >= MAX_BATCHES) document.getElementById('sentinel').textContent = 'no more images';
+      loading = false;
+    }, LOAD_DELAY_MS);
+  });
+
+  add(BATCH_SIZE);
+</script>
+</body>
+</html>

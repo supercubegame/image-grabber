@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Image Grabber",
-  "version": "0.2.0",
-  "description": "Scan the current page for images, filter by size and format, then download them in bulk.",
+  "version": "0.3.0",
+  "description": "Scan the current page for images, optionally auto-scrolling lazy pages first, then download them in bulk.",
   "action": {
     "default_popup": "src/popup/popup.html",
     "default_title": "Image Grabber"
