@@ -63,5 +63,41 @@ export const EXPECTED = {
     // Only here to catch "the timeout never fires". The run is asked to stop at
     // 1500ms; this ceiling has ~10x margin because CI has no GPU and shared CPU.
     timeoutCeilingMs: 15000
+  },
+
+  // --- download retries and progress -------------------------------------------
+  // Coupled to the retry defaults in src/core/retry.js and to the fixture server's
+  // /flaky/ and /once/ routes. The fast gate checks the relationships that matter
+  // rather than trusting this comment; see the coupled-parameters block in
+  // AGENTS.md before changing any of it.
+  downloads: {
+    // How long the browser gate waits for downloads to reach a terminal state.
+    // Lives here rather than in verify-e2e.js so the FAST gate can check it against
+    // worstCaseItemMs(): one bad file must fail the gate, never time it out.
+    gateTimeoutMs: 40000,
+
+    // /flaky/2/... 500s twice, then serves the image. This MUST stay strictly below
+    // maxAttempts (3) or the retry check would quietly be asserting a give-up.
+    flakyFailures: 2,
+    flakyAttempts: 3,
+
+    // A wait measured on a real clock can come up a hair short of the value asked
+    // for; it cannot come up 10% short. Loose enough for a shared CI runner, tight
+    // enough that "did not wait at all" is still a failure.
+    backoffToleranceRatio: 0.9,
+
+    // The mixed run the progress checks use: three healthy files plus one flaky one.
+    mixedTotal: 4,
+    minProgressEvents: 6,
+    // Distinct settled counts (0..4). Three of them cannot come from a single report
+    // at the end of the run, which is the thing being proven.
+    minDistinctProgress: 3,
+    minPaintedWidths: 3,
+
+    // downloads.html: 2 images that always work + 1 that works exactly once, so the
+    // page renders it and every download attempt gets a 500.
+    batchTotal: 3,
+    batchDone: 2,
+    batchFailed: 1
   }
 };

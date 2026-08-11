@@ -1,6 +1,6 @@
 // Popup controller: DOM, storage and messaging only. Anything decision-shaped
-// lives in ../core/images.js and ../core/scroll.js so it can be unit tested
-// without a browser.
+// lives in ../core/images.js, ../core/scroll.js and ../core/retry.js so it can be
+// unit tested without a browser.
 import {
   KNOWN_FORMATS,
   SETTINGS_KEY,
@@ -15,6 +15,12 @@ import { probeDimensions } from './probe.js';
 // than the worst-case probe. Change one, recheck the other (AGENTS.md).
 const PROBE_TIMEOUT_MS = 4000;
 const PROBE_CONCURRENCY = 6;
+const PROGRESS_EVENT_CAP = 300;
+
+const blankProgress = () => ({
+  runId: null, total: 0, done: 0, failed: 0, skipped: 0, settled: 0,
+  retries: 0, retrying: 0, attempts: 0, ratio: 0, complete: false, text: ''
+});
 
 const state = {
   phase: 'init',
@@ -29,14 +35,21 @@ const state = {
   errors: [],
   pageUrl: '',
   tabId: null,
-  scroll: null
+  scroll: null,
+  download: blankProgress(),
+  downloadResult: null,
+  // Every progress payload received and every bar width actually painted, in order.
+  // The second one is the interesting record: a bar that only shows up once the run
+  // is over leaves a single width behind.
+  progressEvents: [],
+  renderedWidths: []
 };
 
 // Read-only diagnostic surface for the verification gate.
 // Fields may be ADDED, never renamed or removed (see AGENTS.md).
 Object.defineProperty(window, '__DIAG__', {
   value: Object.freeze({
-    version: '0.3.0',
+    version: '0.4.0',
     get state() {
       return {
         phase: state.phase,
@@ -50,6 +63,10 @@ Object.defineProperty(window, '__DIAG__', {
         downloadRequested: state.downloadRequested,
         downloadIds: state.downloadIds.slice(),
         scroll: state.scroll,
+        download: { ...state.download },
+        downloadResult: state.downloadResult,
+        progressEvents: state.progressEvents.slice(),
+        renderedWidths: state.renderedWidths.slice(),
         settings: {
           minWidth: state.settings.minWidth,
           minHeight: state.settings.minHeight,
@@ -168,6 +185,54 @@ function bindEvents() {
   });
 }
 
+// The worker broadcasts progress to every extension page. The popup only LISTENS -
+// it must not answer, or it would race the service worker's reply to whoever sent
+// the original message.
+chrome.runtime.onMessage.addListener(message => {
+  if (!message || message.type !== 'download-progress') return;
+  onDownloadProgress(message.progress, message.runId);
+});
+
+function progressText(p) {
+  const parts = [`${p.settled}/${p.total} files`, `${p.done} saved`];
+  if (p.retrying > 0) parts.push(`${p.retrying} retrying`);
+  else if (p.retries > 0) parts.push(`${p.retries} retried`);
+  if (p.failed > 0) parts.push(`${p.failed} failed`);
+  return parts.join(' \u00b7 ') + (p.complete ? '' : ' \u2026');
+}
+
+function onDownloadProgress(progress, runId) {
+  if (!progress || typeof progress.total !== 'number') return;
+  // A new run starts a new record. Without this, one run's bar widths would be read
+  // as the previous run's and the "it moved" assertion would pass for free.
+  if (runId !== undefined && runId !== state.download.runId) {
+    state.progressEvents = [];
+    state.renderedWidths = [];
+  }
+  state.download = { runId: runId === undefined ? state.download.runId : runId, ...progress, text: progressText(progress) };
+  state.progressEvents.push({ ...progress, runId: state.download.runId });
+  if (state.progressEvents.length > PROGRESS_EVENT_CAP) state.progressEvents.shift();
+  renderProgress();
+}
+
+function renderProgress() {
+  const box = byId('progress');
+  const bar = byId('progressBar');
+  const label = byId('progressText');
+  const p = state.download;
+  if (!p.total) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const percent = Math.round(Math.min(1, Math.max(0, p.ratio)) * 100);
+  bar.style.width = percent + '%';
+  bar.classList.toggle('failed', p.failed > 0);
+  label.textContent = p.text;
+  const last = state.renderedWidths[state.renderedWidths.length - 1];
+  if (last !== percent) state.renderedWidths.push(percent);
+}
+
 function shortName(url) {
   if (url.startsWith('data:')) return 'inline data URL';
   try {
@@ -265,10 +330,20 @@ async function downloadSelected() {
   setPhase('downloading');
   const response = await send({ type: 'download', items });
   if (!response || !response.ok) throw new Error(response && response.error ? response.error : 'download failed');
+  const run = response.data;
   state.downloadRequested = items.length;
-  state.downloadIds = response.data.ids;
+  state.downloadIds = run.ids || [];
+  state.downloadResult = {
+    total: run.total, done: run.done, failed: run.failed, skipped: run.skipped,
+    retries: run.retries, warning: run.warning
+  };
+  // Paint the final numbers from the reply as well as from the broadcast: a popup
+  // that was busy when the last event arrived would otherwise sit at 90% forever.
+  if (run.progress) onDownloadProgress(run.progress, run.runId);
   setPhase('ready');
-  byId('status').textContent = `queued ${items.length}`;
+  byId('status').textContent = run.failed || run.skipped
+    ? `${run.done} saved, ${run.failed + run.skipped} failed`
+    : `saved ${run.done}`;
 }
 
 async function activeTabId() {
@@ -309,6 +384,7 @@ async function main() {
   syncControls();
   bindEvents();
   render();
+  renderProgress();
 
   // `?tabId=` is a read-only override used by the verification gate; without it the
   // popup targets the active tab exactly as a user would expect.

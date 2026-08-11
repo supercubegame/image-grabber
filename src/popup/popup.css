@@ -20,6 +20,16 @@ h1 { font-size: 14px; margin: 0; }
   color: #365314; background: #f0fdf4; border-bottom: 1px solid #e5e7eb;
 }
 .note.warn { color: #7c2d12; background: #fff7ed; }
+.progress {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-bottom: 1px solid #e5e7eb;
+}
+.track { flex: 1; height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
+/* No transition on purpose: the width the gate reads back is the width that was
+   set, not something an animation is halfway through. */
+.fill { width: 0; height: 100%; background: #2d7d46; }
+.fill.failed { background: #b91c1c; }
+.progressText { font-size: 11px; color: #6b7280; white-space: nowrap; }
 .list { list-style: none; margin: 0; padding: 0; max-height: 430px; overflow-y: auto; }
 .row { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid #f3f4f6; }
 .thumb { width: 56px; height: 42px; object-fit: cover; background: #f3f4f6; border-radius: 3px; flex: none; }

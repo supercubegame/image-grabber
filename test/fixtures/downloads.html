@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Download batch fixture</title>
+</head>
+<body>
+<h1>Download batch fixture</h1>
+<!--
+  Two images that always work, and one that works exactly ONCE.
+
+  The page itself gets the working copy of the third one, so nothing on this page
+  logs a console error; every LATER request for it - which means every download
+  attempt - gets a 500. That is how a permanent download failure gets exercised
+  through the menu path without failing the zero-console-errors check for a reason
+  that has nothing to do with downloads.
+-->
+<img id="a" src="/img/120x90.png" alt="">
+<img id="b" src="/img/160x120.png" alt="">
+<img id="doomed" src="/once/140x100.png" alt="">
+<script>
+  window.__FIXTURE__ = { images: 3, doomed: '/once/140x100.png', doomedLoaded: false, brokenImages: 0 };
+  const doomed = document.getElementById('doomed');
+  // The gate asserts doomedLoaded === true: if this image had failed to render, the
+  // download failure it is supposed to prove could have come from anywhere.
+  function mark() {
+    window.__FIXTURE__.doomedLoaded = doomed.complete && doomed.naturalWidth > 0;
+    window.__FIXTURE__.brokenImages = Array.from(document.images).filter(i => i.complete && i.naturalWidth === 0).length;
+  }
+  doomed.addEventListener('load', mark);
+  doomed.addEventListener('error', mark);
+  window.addEventListener('load', mark);
+  mark();
+</script>
+</body>
+</html>
