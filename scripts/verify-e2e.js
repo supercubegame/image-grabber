@@ -239,6 +239,30 @@ function describeDownloads(items) {
   return (items || []).map(i => ({ id: i.id, filename: i.filename, state: i.state, bytes: i.bytesReceived, error: i.error }));
 }
 
+// Baselines have to count COMPLETED downloads, not every entry in the profile.
+//
+// This cost a red run: every wait here used to read `search({}).length` before a run
+// and then wait for `complete >= before + N`. That holds only while nothing has ever
+// failed. An `interrupted` entry counts towards the baseline and can never count
+// towards `complete`, so as soon as the retry checks started leaving failed attempts
+// behind, the next wait was asking for more completed downloads than could exist -
+// and it timed out instead of failing, taking every later check down with it.
+const completedCount = () => swEval(() => chrome.downloads.search({ state: 'complete' }).then(items => items.length));
+
+// What a download wait should say when it gives up: the arithmetic, not an inventory.
+// Dumping every download in the profile buried the one number that was wrong.
+function downloadWaitEvidence(expectedComplete, ids) {
+  const all = ctx.downloads || [];
+  return {
+    expectedCompleteAtLeast: expectedComplete,
+    completeNow: all.filter(i => i.state === 'complete').length,
+    interrupted: all.filter(i => i.state === 'interrupted').length,
+    inProgress: all.filter(i => i.state === 'in_progress').length,
+    entries: all.length,
+    thisRun: describeDownloads(Array.isArray(ids) ? all.filter(i => ids.includes(i.id)) : [])
+  };
+}
+
 // Shared by the bulk-download checks: complete downloads that are not on disk are
 // the whole reason this gate looks at the filesystem instead of trusting the API.
 async function expectFilesOnDisk(ids, expectedCount, label) {
@@ -438,7 +462,7 @@ const steps = [
   {
     title: 'download writes real files to disk through chrome.downloads',
     run: async () => {
-      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const before = await completedCount();
       const state = await diag();
       ctx.lastDiag = state;
       expect(state.selected, EXPECTED.downloadCount, 'selected items before download');
@@ -446,7 +470,7 @@ const steps = [
       await waitFor('downloads to reach state=complete', async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.downloadCount;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => ctx.downloads });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + EXPECTED.downloadCount) });
       const done = (ctx.downloads || []).filter(i => i.state === 'complete');
       const paths = done.map(i => i.filename);
       const onDisk = done.filter(i => i.filename && fs.existsSync(i.filename) && fs.statSync(i.filename).size > 0);
@@ -525,7 +549,7 @@ const steps = [
       // Earlier steps left minWidth=200 with jpg off. This path has no UI of its own
       // - it reads the stored settings - so reset them and expect the whole page.
       await swEval(() => chrome.storage.local.remove('settings'));
-      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const before = await completedCount();
       const data = await bulkWith(ctx.tabId, null);
       ctx.lastDiag = data;
       expect(data.found, EXPECTED.uniqueImages, 'images found by the menu-triggered scan');
@@ -539,7 +563,7 @@ const steps = [
       await waitFor(`${EXPECTED.bulkDownloads} menu-triggered downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.bulkDownloads;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + EXPECTED.bulkDownloads, data.ids) });
 
       const written = await expectFilesOnDisk(data.ids, EXPECTED.bulkDownloads, 'menu');
       const names = (ctx.downloads || []).filter(i => data.ids.includes(i.id)).map(i => path.basename(i.filename || ''));
@@ -688,7 +712,7 @@ const steps = [
 
       await swEval(() => chrome.storage.local.remove('settings'));
       await loadFixture(ctx.finite);
-      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const before = await completedCount();
       const data = await bulkWith(ctx.finite.tabId, GATE_SCROLL);
       ctx.lastDiag = await scrollEvidence(ctx.finite, data);
       expect(data.found, EXPECTED.scroll.finiteTotalImages, 'images found by the scrolling bulk run');
@@ -698,7 +722,7 @@ const steps = [
       await waitFor(`${data.planned} scrolled bulk downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + data.planned;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + data.planned, data.ids) });
 
       const written = await expectFilesOnDisk(data.ids, data.planned, 'scrolled bulk');
       const badge = await swEval(() => chrome.action.getBadgeText({}));
@@ -713,7 +737,7 @@ const steps = [
     run: async () => {
       await swEval(() => chrome.storage.local.remove('settings'));
       await loadFixture(ctx.endless);
-      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const before = await completedCount();
       const data = await bulkWith(ctx.endless.tabId, ENDLESS_SCROLL);
       ctx.lastDiag = await scrollEvidence(ctx.endless, data);
       expect(data.endConfirmed, false, 'endConfirmed on a page with no bottom');
@@ -727,7 +751,7 @@ const steps = [
       await waitFor(`${data.planned} unconfirmed bulk downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + data.planned;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + data.planned, data.ids) });
       const written = await expectFilesOnDisk(data.ids, data.planned, 'unconfirmed bulk');
 
       // The badge is the only feedback a menu user gets, and 12 versus 12? mean very
@@ -746,7 +770,7 @@ const steps = [
       const fails = EXPECTED.downloads.flakyFailures;
       const imagePath = `/flaky/${fails}/120x90.png`;
       const items = [{ url: ctx.server.origin + imagePath, filename: 'image-grabber/img-901-flaky.png' }];
-      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const before = await completedCount();
       const run = await downloadWith(items);
       ctx.lastDiag = { run, server: ctx.server.stats() };
 
@@ -793,10 +817,20 @@ const steps = [
       await waitFor('the retried file to reach state=complete', async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + 1;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + 1, run.ids) });
       const written = await expectFilesOnDisk(run.ids, 1, 'retried');
 
-      return `${fails} server failures -> ${attempts.length} attempts, waited ${attempts.map(a => a.waitedMs).join('/')}ms (planned ${attempts.map(a => a.plannedWaitMs).join('/')}), file on disk (${written.bytes}B)`;
+      // Our own records and the fixture's counters both say three transfers happened.
+      // Chrome's own list is the third, independent witness: if the retries had been
+      // bookkeeping rather than real downloads, there would be one entry here.
+      const mine = (ctx.downloads || []).filter(i => (i.url || '').includes(imagePath));
+      const interrupted = mine.filter(i => i.state === 'interrupted').length;
+      const complete = mine.filter(i => i.state === 'complete').length;
+      if (interrupted !== fails || complete !== 1) {
+        throw evidenceError(`chrome recorded ${interrupted} interrupted and ${complete} complete transfer(s) for the flaky url, expected ${fails} and 1`, describeDownloads(mine));
+      }
+
+      return `${fails} server failures -> ${attempts.length} attempts (chrome saw ${interrupted} interrupted + ${complete} complete), waited ${attempts.map(a => a.waitedMs).join('/')}ms (planned ${attempts.map(a => a.plannedWaitMs).join('/')}), file on disk (${written.bytes}B)`;
     }
   },
   {
@@ -811,7 +845,7 @@ const steps = [
         { url: ctx.server.origin + flakyPath, filename: 'image-grabber/img-913-flaky.png' },
         { url: ctx.server.origin + '/img/200x160.png', filename: 'image-grabber/img-914-c.png' }
       ];
-      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const before = await completedCount();
       const run = await downloadWith(items);
       ctx.mixedRun = run;
       const snapshots = await progressFor(run.runId);
@@ -844,7 +878,7 @@ const steps = [
       await waitFor(`${run.total} mixed downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + run.total;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + run.total, run.ids) });
       const written = await expectFilesOnDisk(run.ids, run.total, 'mixed');
 
       return `${snapshots.length} events, ${distinct} distinct states (${settled.join(',')}), ${written.count} files on disk, ${run.retries} retry along the way`;
@@ -906,7 +940,7 @@ const steps = [
         throw evidenceError('the fixture image that is supposed to work exactly once never rendered', { fixture, server: ctx.server.stats() });
       }
 
-      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const before = await completedCount();
       const data = await bulkWith(tabId, null);
       ctx.lastDiag = { data, fixture, server: ctx.server.stats() };
       expect(data.planned, EXPECTED.downloads.batchTotal, 'images queued');
@@ -934,7 +968,7 @@ const steps = [
       await waitFor(`${EXPECTED.downloads.batchDone} healthy downloads to complete`, async () => {
         ctx.downloads = await swEval(() => chrome.downloads.search({}));
         return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.downloads.batchDone;
-      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => downloadWaitEvidence(before + EXPECTED.downloads.batchDone, data.ids) });
       const written = await expectFilesOnDisk(data.ids, EXPECTED.downloads.batchDone, 'partial batch');
 
       // The badge is the menu user's only feedback, and "2" would be a lie here.
