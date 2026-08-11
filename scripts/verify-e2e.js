@@ -131,6 +131,10 @@ async function shoot(name) {
   return Buffer.from(buffer);
 }
 
+function describeDownloads(items) {
+  return (items || []).map(i => ({ id: i.id, filename: i.filename, state: i.state, bytes: i.bytesReceived, error: i.error }));
+}
+
 const steps = [
   {
     title: 'unpacked extension loads and its service worker is alive',
@@ -357,6 +361,86 @@ const steps = [
       expect(state.scanned, EXPECTED.secondPageUnique, 'unique images on the second page');
       if (state.pageUrl !== url) throw evidenceError(`popup scanned ${state.pageUrl}, expected ${url}`, state);
       return `second tab scanned on its own: ${state.scanned} images from ${state.pageUrl}`;
+    }
+  },
+  {
+    title: 'the page context menu is registered with chrome and its click handler is attached',
+    critical: true,
+    run: async () => {
+      const api = await swEval(() => typeof chrome.contextMenus);
+      if (api !== 'object') throw evidenceError(`chrome.contextMenus is ${api} in the worker - is the permission declared?`, { api });
+      // Registration is asynchronous (removeAll -> create), so poll for a verdict
+      // instead of racing it. Either outcome ends the wait; the assertions below
+      // decide which one it was.
+      await waitFor('the context menu registration to report back', async () => {
+        ctx.menu = await swEval(() => {
+          const m = self.__DIAG__.contextMenu;
+          return m ? { id: m.id, created: m.created, error: m.error, listenerAttached: m.listenerAttached } : null;
+        });
+        return Boolean(ctx.menu && (ctx.menu.created || ctx.menu.error));
+      }, { snapshot: () => ctx.menu });
+      if (ctx.menu.error) throw evidenceError('chrome rejected the context menu: ' + ctx.menu.error, ctx.menu);
+      if (!ctx.menu.created) throw evidenceError('the context menu was never created', ctx.menu);
+      if (ctx.menu.id !== EXPECTED.contextMenuId) throw evidenceError(`menu id is "${ctx.menu.id}", expected "${EXPECTED.contextMenuId}"`, ctx.menu);
+      // A menu item nobody listens to looks perfectly healthy and does nothing.
+      if (!ctx.menu.listenerAttached) throw evidenceError('nothing is listening on contextMenus.onClicked - the item would be inert', ctx.menu);
+      return `menu "${ctx.menu.id}" accepted by chrome, onClicked handler attached`;
+    }
+  },
+  {
+    title: 'the context-menu action bulk-downloads every filtered image to disk',
+    run: async () => {
+      // Headless Chrome cannot open a native context menu, so the gate drives the
+      // other trigger of the SAME function (bulkDownload in the service worker) and
+      // the step above proves the click is wired to it.
+      //
+      // Earlier steps left minWidth=200 with jpg off. This path has no UI of its own
+      // - it reads the stored settings - so reset them and expect the whole page.
+      await swEval(() => chrome.storage.local.remove('settings'));
+      const before = await swEval(() => chrome.downloads.search({}).then(items => items.length));
+      const response = await ctx.popup.evaluate(
+        tabId => chrome.runtime.sendMessage({ type: 'bulk-download', tabId }),
+        ctx.tabId
+      );
+      if (!response || !response.ok) throw evidenceError('the bulk download request failed', response);
+      const data = response.data;
+      ctx.lastDiag = data;
+      expect(data.found, EXPECTED.uniqueImages, 'images found by the menu-triggered scan');
+      expect(data.planned, EXPECTED.bulkDownloads, 'images queued in one click');
+      expect(data.skipped, EXPECTED.bulkSkipped, 'images skipped by the stored filters');
+
+      await waitFor(`${EXPECTED.bulkDownloads} menu-triggered downloads to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.bulkDownloads;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+
+      const mine = (ctx.downloads || []).filter(i => data.ids.includes(i.id) && i.state === 'complete');
+      if (mine.length !== EXPECTED.bulkDownloads) {
+        throw evidenceError(`${mine.length} of ${EXPECTED.bulkDownloads} queued downloads completed`, describeDownloads((ctx.downloads || []).filter(i => data.ids.includes(i.id))));
+      }
+      const onDisk = mine.filter(i => i.filename && fs.existsSync(i.filename) && fs.statSync(i.filename).size > 0);
+      if (onDisk.length !== mine.length) {
+        throw evidenceError('chrome reported complete downloads that are not on disk', describeDownloads(mine));
+      }
+      const names = onDisk.map(i => path.basename(i.filename));
+      const folders = new Set(onDisk.map(i => path.basename(path.dirname(i.filename))));
+      if (folders.size !== 1 || !folders.has('image-grabber')) {
+        throw evidenceError('menu downloads did not all land in the image-grabber folder', onDisk.map(i => i.filename).join('\n'));
+      }
+      const stray = names.find(n => !/^img-\d{3}-/.test(n));
+      if (stray) throw evidenceError(`"${stray}" is not a generated name - chrome named this one itself`, names.join('\n'));
+      if (names.some(n => n.includes('inline'))) throw evidenceError('the inline data: url was downloaded despite being filtered out', names.join('\n'));
+
+      const badge = await swEval(() => chrome.action.getBadgeText({}));
+      if (badge !== String(EXPECTED.bulkDownloads)) {
+        throw evidenceError(`the toolbar badge reads "${badge}", expected "${EXPECTED.bulkDownloads}" - the only feedback this action gives`, { badge });
+      }
+      const bulk = await swEval(() => ({ runs: self.__DIAG__.bulkRuns, last: self.__DIAG__.lastBulk }));
+      if (!bulk.last || bulk.runs < 1) throw evidenceError('the worker recorded no bulk run', bulk);
+      expect(bulk.last.planned, EXPECTED.bulkDownloads, '__DIAG__.lastBulk.planned');
+
+      const bytes = onDisk.reduce((sum, i) => sum + fs.statSync(i.filename).size, 0);
+      return `one action -> ${onDisk.length} files, ${bytes}B total: ${names.join(', ')}; badge "${badge}"`;
     }
   },
   {
