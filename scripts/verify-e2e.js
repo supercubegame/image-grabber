@@ -265,12 +265,15 @@ const steps = [
       await waitForVisible(0);
       const shown = await ctx.popup.evaluate(() => !document.getElementById('empty').hidden);
       if (!shown) throw new Error('list is empty but the empty-state message is hidden');
+      // This screenshot is the baseline for the colour delta in the next step. Note
+      // how high the number is: that is exactly why an absolute floor there was
+      // meaningless.
       ctx.colorsEmpty = countDistinctColors(decodePng(await shoot('popup-empty.png')), 3);
       return `0 rows, empty state shown, ${ctx.colorsEmpty} distinct colours on screen`;
     }
   },
   {
-    title: 'the populated list actually paints pixels (colour delta vs empty state)',
+    title: 'the populated list actually paints pixels (colour delta vs the empty state)',
     run: async () => {
       await setNumber('minWidth', 0);
       await waitForVisible(EXPECTED.defaultVisible);
@@ -278,14 +281,19 @@ const steps = [
         () => Array.from(document.querySelectorAll('img.thumb')).every(i => i.complete && i.naturalWidth > 0)
       ));
       ctx.colorsPopulated = countDistinctColors(decodePng(await shoot('popup-populated.png')), 3);
+      // Only the delta is asserted. An absolute floor (minColorsPopulated = 40) used
+      // to sit here and it could never fail: the EMPTY popup already samples ~395
+      // colours of chrome and text, so it passed with the list completely broken.
+      // The difference between the two screenshots is the part that can only come
+      // from decoded thumbnails.
+      if (!(ctx.colorsEmpty > 0)) {
+        throw evidenceError('no empty-state baseline was captured, so a delta would prove nothing', { empty: ctx.colorsEmpty, populated: ctx.colorsPopulated });
+      }
       const delta = ctx.colorsPopulated - ctx.colorsEmpty;
-      if (ctx.colorsPopulated < EXPECTED.minColorsPopulated) {
-        throw evidenceError(`populated popup shows only ${ctx.colorsPopulated} distinct colours, expected at least ${EXPECTED.minColorsPopulated}`, { empty: ctx.colorsEmpty, populated: ctx.colorsPopulated });
-      }
       if (delta < EXPECTED.minColorDelta) {
-        throw evidenceError(`colour delta is ${delta}, expected at least ${EXPECTED.minColorDelta}`, { empty: ctx.colorsEmpty, populated: ctx.colorsPopulated });
+        throw evidenceError(`colour delta is ${delta}, expected at least ${EXPECTED.minColorDelta}`, { empty: ctx.colorsEmpty, populated: ctx.colorsPopulated, delta, floor: EXPECTED.minColorDelta });
       }
-      return `${ctx.colorsEmpty} -> ${ctx.colorsPopulated} distinct colours (delta ${delta})`;
+      return `${ctx.colorsEmpty} -> ${ctx.colorsPopulated} distinct colours (delta ${delta}, floor ${EXPECTED.minColorDelta})`;
     }
   },
   {
