@@ -7,6 +7,12 @@ import { DEFAULT_SCROLL_OPTIONS, mergeScrollOptions } from './scroll.js';
 
 export const KNOWN_FORMATS = ['png', 'jpg', 'gif', 'webp', 'svg', 'avif', 'bmp', 'ico', 'other'];
 
+// How many elements the injected collector walks looking for CSS backgrounds.
+// This is a COPY of MAX_ELEMENTS in src/content/collect.js: an injected classic
+// script cannot import this module. The fast gate compares the two, because a copy
+// nobody checks is a copy that drifts.
+export const SCAN_ELEMENT_LIMIT = 4000;
+
 // Where downloads land, and the storage key the settings live under. Both are
 // shared by the popup and the service worker: two copies of a string is two
 // places for them to disagree.
@@ -39,6 +45,118 @@ export function mergeSettings(partial) {
     formats,
     filenamePrefix: prefix,
     scroll: mergeScrollOptions(input.scroll)
+  };
+}
+
+const CSS_WHITESPACE = ' \t\n\r\f';
+
+// Pulls every url() out of one computed CSS value.
+//
+// This replaces the regex /url\((['"]?)([^'")]+)\1\)/g that used to live in the
+// collector. That pattern could not tell a bracket inside a quoted string from the
+// one that closes the function, so `url("shot(2).png")` matched nothing at all and
+// the image was dropped without a trace. A scanner is longer and it is right.
+//
+// Returns strings exactly as written; resolution and filtering happen later, in
+// normalizeCandidates.
+export function parseCssUrls(value) {
+  const text = typeof value === 'string' ? value : '';
+  if (!text || text === 'none') return [];
+  const lower = text.toLowerCase();
+  const found = [];
+  let i = 0;
+  while (i < text.length) {
+    const at = lower.indexOf('url(', i);
+    if (at < 0) break;
+    // `image-set(url(...))` is a url token; `myurl(...)` is a different function.
+    const before = at > 0 ? text[at - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) {
+      i = at + 4;
+      continue;
+    }
+    let j = at + 4;
+    while (j < text.length && CSS_WHITESPACE.includes(text[j])) j += 1;
+    const quote = text[j] === '"' || text[j] === "'" ? text[j] : '';
+    if (quote) j += 1;
+    let raw = '';
+    let closed = false;
+    while (j < text.length) {
+      const ch = text[j];
+      if (ch === '\\' && j + 1 < text.length) {
+        raw += text[j + 1];
+        j += 2;
+        continue;
+      }
+      if (quote ? ch === quote : ch === ')') {
+        closed = true;
+        j += 1;
+        break;
+      }
+      raw += ch;
+      j += 1;
+    }
+    if (quote && closed) {
+      // A quoted url may be padded before the closing bracket. If the bracket is
+      // missing the declaration is truncated and this is not a url at all.
+      while (j < text.length && CSS_WHITESPACE.includes(text[j])) j += 1;
+      if (text[j] === ')') j += 1;
+      else closed = false;
+    }
+    const url = raw.trim();
+    if (closed && url) found.push(url);
+    i = closed ? j : at + 4;
+  }
+  return found;
+}
+
+// Raw computed values from the collector -> candidates, one per url.
+//
+// A single declaration can name several images (layered backgrounds, image-set),
+// which is the other half of why parsing does not belong in the injected script:
+// this is the part worth unit testing and it cannot be reached from in there.
+export function expandStyleCandidates(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const out = [];
+  for (const entry of list) {
+    if (!entry || typeof entry.value !== 'string') continue;
+    const origin = typeof entry.origin === 'string' && entry.origin ? entry.origin : 'element';
+    for (const src of parseCssUrls(entry.value)) {
+      out.push({ src, width: 0, height: 0, source: 'background', alt: '', origin });
+    }
+  }
+  return out;
+}
+
+// How much of the page the collector actually inspected.
+//
+// A MISSING or malformed report is INCOMPLETE, never complete: "we could not tell"
+// and "we saw all of it" must not be the same answer. Same rule as an unconfirmed
+// scroll - a run that did not see the whole page may never read as a clean sweep.
+// `complete` and `warning` are exclusive; exactly one of them says what happened.
+export function scanCoverage(raw) {
+  const value = raw && typeof raw === 'object' ? raw : null;
+  const count = n => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : null);
+  const elementLimit = value ? count(value.elementLimit) : null;
+  const elementsTotal = value ? count(value.elementsTotal) : null;
+  const elementsScanned = value ? count(value.elementsScanned) : null;
+  if (elementLimit === null || elementsTotal === null || elementsScanned === null) {
+    return {
+      elementLimit,
+      elementsTotal,
+      elementsScanned,
+      complete: false,
+      warning: 'scan INCOMPLETE: the collector did not report how much of the page it inspected'
+    };
+  }
+  const complete = elementsScanned >= elementsTotal;
+  return {
+    elementLimit,
+    elementsTotal,
+    elementsScanned,
+    complete,
+    warning: complete
+      ? null
+      : `scan INCOMPLETE: only the first ${elementsScanned} of ${elementsTotal} elements were inspected for CSS backgrounds (limit ${elementLimit}) - images referenced below that point are missing`
   };
 }
 
