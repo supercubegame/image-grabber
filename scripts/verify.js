@@ -7,13 +7,16 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Report } from './lib/report.js';
 import { encodePng, decodePng, countDistinctColors } from './lib/png.js';
+import { planDownloads, DOWNLOAD_FOLDER } from '../src/core/images.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const UNIT_DIR = path.join(ROOT, 'test', 'unit');
 // Guards against the classic false green: a runner that finds nothing still exits 0.
-const MIN_UNIT_FILES = 3;
-const MIN_UNIT_TESTS = 12;
+// Today: 24 tests across 5 files. Keep a little slack, not a lot - the point is to
+// notice when a file stops being discovered.
+const MIN_UNIT_FILES = 5;
+const MIN_UNIT_TESTS = 20;
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -40,7 +43,7 @@ report.check('manifest.json is valid MV3 and references only files that exist', 
   const missing = refs.filter(r => !exists(r));
   if (missing.length) throw fail('manifest references missing files: ' + missing.join(', '), refs.join('\n'));
   const perms = manifest.permissions || [];
-  const lacking = ['downloads', 'scripting', 'storage', 'tabs'].filter(p => !perms.includes(p));
+  const lacking = ['downloads', 'scripting', 'storage', 'tabs', 'contextMenus'].filter(p => !perms.includes(p));
   if (lacking.length) throw fail('missing permissions: ' + lacking.join(', '), JSON.stringify(manifest.permissions));
   return `MV3, ${refs.length} referenced files present, permissions ${perms.join('/')}`;
 });
@@ -93,6 +96,40 @@ report.check('src/core stays pure (no DOM, chrome API, clock or unseeded randomn
   }
   if (hits.length) throw fail(`core is not pure any more (${hits.length} offending lines)`, hits.join('\n'));
   return `${files.length} core file(s) clean`;
+});
+
+// Both download triggers - the popup button and the page context menu - build
+// their paths here, so a hole in this function is a hole in a page's ability to
+// write outside the download folder.
+report.check('planDownloads keeps hostile page URLs inside the download folder', () => {
+  const base = { width: 10, height: 10, format: 'png', isData: false, occurrences: 1 };
+  const hostile = [
+    { url: 'https://e.com/../../../etc/passwd.png' },
+    { url: 'https://e.com/a/..%2f..%2fescape.png' },
+    { url: 'https://e.com/%2e%2e/%2e%2e/x.jpg', format: 'jpg' },
+    { url: 'https://e.com/dir/sub/', format: 'other' },
+    { url: 'https://e.com/name with spaces & symbols.PNG' },
+    { url: 'https://e.com/' + 'x'.repeat(300) + '.png' },
+    { url: 'https://e.com/.hidden/..png' },
+    { url: 'data:image/png;base64,AAAA', isData: true }
+  ].map(over => ({ ...base, ...over }));
+
+  const plan = planDownloads(hostile, { includeDataUrls: true, filenamePrefix: '../../etc' });
+  // Without this the whole check goes vacuous: an empty plan satisfies every
+  // "no bad path" assertion below.
+  if (plan.length !== hostile.length) {
+    throw fail(`planned ${plan.length} of ${hostile.length} downloads - the filters dropped inputs this check exists to cover`, JSON.stringify(plan, null, 2));
+  }
+  const shape = new RegExp(`^${DOWNLOAD_FOLDER}/[a-z0-9][a-z0-9._-]*\\.[a-z0-9]+$`);
+  const bad = plan.filter(entry =>
+    !shape.test(entry.filename) ||
+    entry.filename.includes('..') ||
+    entry.filename.includes('\\') ||
+    entry.filename.split('/').length !== 2
+  );
+  if (bad.length) throw fail(`${bad.length} of ${plan.length} planned paths escape or malform the download folder`, bad.map(b => b.filename).join('\n'));
+  const longest = plan.reduce((max, e) => Math.max(max, e.filename.length), 0);
+  return `${plan.length} hostile urls -> ${plan.length} paths, all matching ${DOWNLOAD_FOLDER}/<safe name> (longest ${longest} chars)`;
 });
 
 report.check('png codec round-trips (the gate\'s own screenshot tooling)', () => {

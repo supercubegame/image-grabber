@@ -2,10 +2,11 @@
 // lives in ../core/images.js so it can be unit tested without a browser.
 import {
   KNOWN_FORMATS,
+  SETTINGS_KEY,
   mergeSettings,
   normalizeCandidates,
   applyFilters,
-  suggestFilename
+  planDownloads
 } from '../core/images.js';
 import { probeDimensions } from './probe.js';
 
@@ -13,8 +14,6 @@ import { probeDimensions } from './probe.js';
 // than the worst-case probe. Change one, recheck the other (AGENTS.md).
 const PROBE_TIMEOUT_MS = 4000;
 const PROBE_CONCURRENCY = 6;
-const DOWNLOAD_FOLDER = 'image-grabber';
-const STORAGE_KEY = 'settings';
 
 const state = {
   phase: 'init',
@@ -34,7 +33,7 @@ const state = {
 // Fields may be ADDED, never renamed or removed (see AGENTS.md).
 Object.defineProperty(window, '__DIAG__', {
   value: Object.freeze({
-    version: '0.1.0',
+    version: '0.2.0',
     get state() {
       return {
         phase: state.phase,
@@ -81,12 +80,12 @@ function send(message) {
 }
 
 async function loadSettings() {
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
-  return mergeSettings(stored ? stored[STORAGE_KEY] : null);
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  return mergeSettings(stored ? stored[SETTINGS_KEY] : null);
 }
 
 function saveSettings() {
-  return chrome.storage.local.set({ [STORAGE_KEY]: state.settings });
+  return chrome.storage.local.set({ [SETTINGS_KEY]: state.settings });
 }
 
 function onSettingsChanged() {
@@ -221,10 +220,9 @@ async function probeUnknown() {
 async function downloadSelected() {
   const picked = state.visible.filter(item => state.selected.has(item.url));
   if (!picked.length) return;
-  const items = picked.map((item, index) => ({
-    url: item.url,
-    filename: `${DOWNLOAD_FOLDER}/${suggestFilename(item, index, state.settings)}`
-  }));
+  // Same planner the context menu uses: the folder and the naming rules live in
+  // the core, not in two places that can drift.
+  const items = planDownloads(picked, state.settings);
   setPhase('downloading');
   const response = await send({ type: 'download', items });
   if (!response || !response.ok) throw new Error(response && response.error ? response.error : 'download failed');

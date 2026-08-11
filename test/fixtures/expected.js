@@ -13,6 +13,12 @@ export const EXPECTED = {
   downloadCount: 2,
   secondPageUnique: 2,
   probedBackground: { path: '/img/500x400.png', width: 500, height: 400 },
+  // Context menu, default settings: every unique image except the inline data url.
+  // No probing happens on this path (a worker has no DOM), which is fine at the
+  // default min size of 0 - see AGENTS.md before pairing it with a size filter.
+  contextMenuId: 'download-all-images',
+  bulkDownloads: 5,
+  bulkSkipped: 1,
   // Colour thresholds keep a wide margin: the populated popup renders five gradient
   // thumbnails and measures in the hundreds. These only catch a blank render.
   minColorsPopulated: 40,
