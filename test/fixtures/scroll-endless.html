@@ -13,12 +13,12 @@
 <h1>lazy gallery (endless)</h1>
 <!--
   Never runs out: 3 images on load, 2 more every time the bottom is reached,
-  forever. This is the page the scroll cap and the total timeout exist for, and
-  the one that proves an aborted run is reported as end-NOT-confirmed instead of
-  as a clean sweep.
+  forever. This is the page the scroll cap and the total timeout exist for, and the
+  one that proves an aborted run is reported as end-NOT-confirmed instead of as a
+  clean sweep.
 -->
 <div id="items"></div>
-<div class="sentinel" id="sentinel">loading more\u2026</div>
+<div class="sentinel" id="sentinel">loading more...</div>
 <script>
   var BATCH_SIZE = 2;
   var LOAD_DELAY_MS = 100;

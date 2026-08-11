@@ -14,7 +14,7 @@ const MENU_TITLE_SCROLL = 'Scroll to load more, then download all images';
 // Badge text has room for about four characters; past that it is a smear.
 const BADGE_CAP = 99;
 // The state machine always terminates on its own limits; this only catches a bug
-// in the state machine itself, which would otherwise be an infinite loop in a
+// in the state machine itself, which would otherwise be an infinite loop inside a
 // service worker - the worst possible place for one.
 const SCROLL_SAFETY_ROUNDS = 10;
 
@@ -40,8 +40,8 @@ self.__DIAG__ = {
       return Boolean(chrome.contextMenus && chrome.contextMenus.onClicked.hasListener(onMenuClicked));
     }
   },
-  // Added, not folded into the field above: `contextMenu` is part of the frozen
-  // diagnostic contract and turning it into an array would break every reader.
+  // Added as a sibling, not folded into the field above: `contextMenu` is part of
+  // the diagnostic contract and turning it into an array would break every reader.
   contextMenuScroll: {
     id: MENU_ID_SCROLL,
     created: false,
@@ -85,6 +85,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // Drives src/content/scroll_step.js in a loop and feeds every measurement to the
 // pure state machine. The worker holds the clock; the criterion, the limits and
 // the verdict all live in src/core/scroll.js.
+//
+// An unconfirmed end is NOT recorded in __DIAG__.errors: it is an expected outcome
+// that the caller already surfaces through `warning` and the badge. Filing it as an
+// error would make the gate's zero-errors check red for a page doing nothing wrong.
 async function autoScroll(tabId, options) {
   const config = mergeScrollOptions(options);
   const startedAt = Date.now();
@@ -106,7 +110,6 @@ async function autoScroll(tabId, options) {
   const summary = scrollSummary(run);
   self.__DIAG__.scrollRuns += 1;
   self.__DIAG__.lastScroll = summary;
-  if (summary.warning) recordError('autoScroll', summary.warning);
   return summary;
 }
 
@@ -145,7 +148,7 @@ async function loadSettings() {
   return mergeSettings(stored ? stored[SETTINGS_KEY] : null);
 }
 
-// One entry point for every trigger: the two right-click menu items and the
+// One entry point for every trigger: both right-click menu items and the
 // `bulk-download` message. Headless Chrome cannot open a native context menu, so
 // the gate drives the message path - keeping them a single function is what makes
 // that honest.
@@ -186,7 +189,7 @@ async function bulkDownload(tabId, scrollOverride) {
 }
 
 // The menu is silent by nature - without this the user cannot tell whether the
-// click did anything at all. The "?" suffix is the only place an unconfirmed
+// click did anything at all. The trailing "?" is the only place an unconfirmed
 // scroll is visible to someone who used the menu instead of the popup.
 async function setBadge(count, uncertain) {
   if (!chrome.action || !chrome.action.setBadgeText) return;
