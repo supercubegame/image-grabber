@@ -1,0 +1,17 @@
+{
+  "name": "image-grabber",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 extension: scan a page for images and download them in bulk.",
+  "scripts": {
+    "verify": "node scripts/verify.js",
+    "verify:e2e": "node scripts/verify-e2e.js"
+  },
+  "devDependencies": {
+    "puppeteer": "23.11.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
