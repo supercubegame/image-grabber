@@ -3,6 +3,7 @@
 // No DOM, no chrome APIs, no clock, no randomness, no I/O - enforced by the fast
 // gate. That is what makes this unit testable without a browser and what makes
 // "same input, same output" an assertion instead of a hope.
+import { DEFAULT_SCROLL_OPTIONS, mergeScrollOptions } from './scroll.js';
 
 export const KNOWN_FORMATS = ['png', 'jpg', 'gif', 'webp', 'svg', 'avif', 'bmp', 'ico', 'other'];
 
@@ -17,7 +18,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   minHeight: 0,
   includeDataUrls: false,
   formats: KNOWN_FORMATS.slice(),
-  filenamePrefix: 'img'
+  filenamePrefix: 'img',
+  // Auto-scroll is off by default: it is slow and it moves the user's page.
+  scroll: DEFAULT_SCROLL_OPTIONS
 });
 
 export function mergeSettings(partial) {
@@ -34,7 +37,8 @@ export function mergeSettings(partial) {
     minHeight: size(input.minHeight),
     includeDataUrls: input.includeDataUrls === true,
     formats,
-    filenamePrefix: prefix
+    filenamePrefix: prefix,
+    scroll: mergeScrollOptions(input.scroll)
   };
 }
 
