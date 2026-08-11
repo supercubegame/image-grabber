@@ -11,6 +11,7 @@ import { Report } from './lib/report.js';
 import { decodePng, countDistinctColors } from './lib/png.js';
 import { startServer } from '../test/fixtures/server.js';
 import { EXPECTED } from '../test/fixtures/expected.js';
+import { DEFAULT_RETRY_OPTIONS } from '../src/core/retry.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
@@ -19,7 +20,11 @@ const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 // Change one, recheck the other (AGENTS.md).
 const POLL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 250;
-const DOWNLOAD_TIMEOUT_MS = 40000;
+// Lives in expected.js so the FAST gate can check it against worstCaseItemMs() from
+// the retry defaults: one file that keeps failing must FAIL this gate, never time it
+// out. Change the retry budgets and the fast gate will tell you if this needs to
+// move with them.
+const DOWNLOAD_TIMEOUT_MS = EXPECTED.downloads.gateTimeoutMs;
 const LAUNCH_TIMEOUT_MS = 60000;
 
 // Auto-scroll option sets. Coupled to the fixture batch maths in expected.js:
@@ -180,6 +185,20 @@ async function bulkWith(tabId, scroll) {
   return response.data;
 }
 
+// The popup's own download path, with the item list handed in directly. Retry checks
+// go through here rather than through a page because a page whose <img> answers 500
+// logs a console error, and the zero-errors check would then fail for a reason that
+// has nothing to do with retrying. The menu path gets its failure covered by
+// downloads.html and /once/ instead.
+async function downloadWith(items) {
+  const response = await ctx.popup.evaluate(
+    list => chrome.runtime.sendMessage({ type: 'download', items: list }),
+    items
+  );
+  if (!response || !response.ok) throw evidenceError('the download request failed', response);
+  return response.data;
+}
+
 async function openPopup(tabId) {
   const target = tabId === undefined ? ctx.tabId : tabId;
   await ctx.popup.goto(`chrome-extension://${ctx.extId}/src/popup/popup.html?tabId=${target}`, {
@@ -237,6 +256,11 @@ async function expectFilesOnDisk(ids, expectedCount, label) {
   }
   const bytes = onDisk.reduce((sum, i) => sum + fs.statSync(i.filename).size, 0);
   return { count: onDisk.length, bytes };
+}
+
+// Progress snapshots the worker published for one run, in order.
+async function progressFor(runId) {
+  return swEval(id => self.__DIAG__.progressSnapshots.filter(s => s.runId === id), runId);
 }
 
 const steps = [
@@ -507,6 +531,8 @@ const steps = [
       expect(data.found, EXPECTED.uniqueImages, 'images found by the menu-triggered scan');
       expect(data.planned, EXPECTED.bulkDownloads, 'images queued in one click');
       expect(data.skipped, EXPECTED.bulkSkipped, 'images skipped by the stored filters');
+      expect(data.downloaded, EXPECTED.bulkDownloads, 'images that reached disk');
+      expect(data.failed, 0, 'failed downloads on a healthy page');
       // No scrolling was asked for, so there is no end to confirm either way.
       if (data.scroll !== null) throw evidenceError('a bulk run without auto-scroll reported a scroll summary', data.scroll);
 
@@ -711,6 +737,212 @@ const steps = [
         throw evidenceError(`the badge reads ${badge}, expected ${data.planned}? - an unconfirmed sweep must not look like a complete one`, { badge, planned: data.planned, warning: data.warning });
       }
       return `${written.count} files grabbed but flagged: badge ${badge}, warning: ${data.warning}`;
+    }
+  },
+  {
+    title: 'a flaky server is retried until the file lands, and the growing backoff was really waited out',
+    run: async () => {
+      ctx.server.reset();
+      const fails = EXPECTED.downloads.flakyFailures;
+      const imagePath = `/flaky/${fails}/120x90.png`;
+      const items = [{ url: ctx.server.origin + imagePath, filename: 'image-grabber/img-901-flaky.png' }];
+      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const run = await downloadWith(items);
+      ctx.lastDiag = { run, server: ctx.server.stats() };
+
+      // Non-vacuity first. Had the fixture served the image on the first request there
+      // would have been nothing to retry, and every number below would still look
+      // perfectly healthy.
+      const served = ctx.server.stats()[imagePath];
+      if (!served || served.failures !== fails || served.successes !== 1) {
+        throw evidenceError(`the fixture served ${served ? served.failures : 0} failure(s) and ${served ? served.successes : 0} success(es), expected ${fails} then 1 - nothing here would be proven`, ctx.lastDiag);
+      }
+
+      expect(run.done, 1, 'files downloaded');
+      expect(run.failed, 0, 'files failed');
+      expect(run.retries, fails, 'retries performed');
+      expect(run.warning, null, 'a run where everything landed must not warn');
+      const attempts = run.items[0].attempts;
+      expect(attempts.length, EXPECTED.downloads.flakyAttempts, 'attempts recorded');
+      if (attempts[0].waitedMs !== 0) throw evidenceError('the first attempt waited before even trying', attempts);
+      if (attempts.slice(0, -1).some(a => a.reason !== 'SERVER_FAILED' || a.retryable !== true)) {
+        throw evidenceError('the failed attempts were not classified as retryable server failures', attempts);
+      }
+
+      // The point of the whole step. Two independent readings off the worker's real
+      // clock: the wait it measured around its own sleep, and the gap between the
+      // previous attempt ending and this one starting. A retry loop that computed the
+      // backoff and never awaited it would show ~0 for both.
+      const tolerance = EXPECTED.downloads.backoffToleranceRatio;
+      const problems = [];
+      for (let i = 1; i < attempts.length; i += 1) {
+        const planned = attempts[i].plannedWaitMs;
+        const measured = attempts[i].waitedMs;
+        const gap = attempts[i].startedAt - attempts[i - 1].endedAt;
+        if (measured < planned * tolerance) problems.push(`attempt ${i + 1}: measured wait ${measured}ms against a planned ${planned}ms`);
+        if (gap < planned * tolerance) problems.push(`attempt ${i + 1}: only ${gap}ms of wall clock between the previous attempt ending and this one starting, planned ${planned}ms`);
+        if (i > 1) {
+          if (planned <= attempts[i - 1].plannedWaitMs) problems.push(`attempt ${i + 1}: planned wait ${planned}ms did not grow past ${attempts[i - 1].plannedWaitMs}ms`);
+          if (measured <= attempts[i - 1].waitedMs) problems.push(`attempt ${i + 1}: measured wait ${measured}ms did not grow past ${attempts[i - 1].waitedMs}ms`);
+        }
+      }
+      if (problems.length) {
+        throw evidenceError(`${problems.length} backoff problem(s): the retry either did not wait or did not back off`, { problems, attempts, server: ctx.server.stats() });
+      }
+
+      await waitFor('the retried file to reach state=complete', async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + 1;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      const written = await expectFilesOnDisk(run.ids, 1, 'retried');
+
+      return `${fails} server failures -> ${attempts.length} attempts, waited ${attempts.map(a => a.waitedMs).join('/')}ms (planned ${attempts.map(a => a.plannedWaitMs).join('/')}), file on disk (${written.bytes}B)`;
+    }
+  },
+  {
+    title: 'the worker reports progress while a run is in flight, monotonically, ending at the real total',
+    critical: true,
+    run: async () => {
+      ctx.server.reset();
+      const flakyPath = `/flaky/${EXPECTED.downloads.flakyFailures}/180x140.png`;
+      const items = [
+        { url: ctx.server.origin + '/img/120x90.png', filename: 'image-grabber/img-911-a.png' },
+        { url: ctx.server.origin + '/img/160x120.png', filename: 'image-grabber/img-912-b.png' },
+        { url: ctx.server.origin + flakyPath, filename: 'image-grabber/img-913-flaky.png' },
+        { url: ctx.server.origin + '/img/200x160.png', filename: 'image-grabber/img-914-c.png' }
+      ];
+      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const run = await downloadWith(items);
+      ctx.mixedRun = run;
+      const snapshots = await progressFor(run.runId);
+      ctx.lastDiag = { run, snapshots, server: ctx.server.stats() };
+
+      expect(run.total, EXPECTED.downloads.mixedTotal, 'files in the run');
+      expect(run.done, EXPECTED.downloads.mixedTotal, 'files downloaded');
+      expect(run.retries, EXPECTED.downloads.flakyFailures, 'retries performed');
+      if (snapshots.length < EXPECTED.downloads.minProgressEvents) {
+        throw evidenceError(`the worker published ${snapshots.length} progress events, expected at least ${EXPECTED.downloads.minProgressEvents}`, ctx.lastDiag);
+      }
+      const settled = snapshots.map(s => s.settled);
+      for (let i = 1; i < settled.length; i += 1) {
+        if (settled[i] < settled[i - 1]) throw evidenceError(`progress went backwards: ${settled.join(',')}`, ctx.lastDiag);
+      }
+      // The assertion that cannot be satisfied by reporting once at the end.
+      const distinct = new Set(settled).size;
+      if (distinct < EXPECTED.downloads.minDistinctProgress) {
+        throw evidenceError(`only ${distinct} distinct progress states were reported (${settled.join(',')}) - progress that only appears when the run is over is not progress`, ctx.lastDiag);
+      }
+      if (settled[0] !== 0) throw evidenceError('the run did not announce itself before the first file landed', ctx.lastDiag);
+      if (!snapshots.some(s => s.retrying > 0)) {
+        throw evidenceError('no snapshot ever showed a file as retrying, so the retry was invisible while it happened', ctx.lastDiag);
+      }
+      const last = snapshots[snapshots.length - 1];
+      if (last.settled !== run.total || last.ratio !== 1 || last.complete !== true) {
+        throw evidenceError('the final progress event does not match the finished run', { last, run: { total: run.total, done: run.done } });
+      }
+
+      await waitFor(`${run.total} mixed downloads to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + run.total;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      const written = await expectFilesOnDisk(run.ids, run.total, 'mixed');
+
+      return `${snapshots.length} events, ${distinct} distinct states (${settled.join(',')}), ${written.count} files on disk, ${run.retries} retry along the way`;
+    }
+  },
+  {
+    title: 'the popup progress bar actually moved during that run, and says what happened',
+    run: async () => {
+      const state = await diag();
+      ctx.lastDiag = state;
+      const events = state.progressEvents || [];
+      const widths = state.renderedWidths || [];
+      if (events.length < EXPECTED.downloads.minProgressEvents) {
+        throw evidenceError(`the popup received ${events.length} progress events, expected at least ${EXPECTED.downloads.minProgressEvents}`, { events, download: state.download });
+      }
+      // Widths are only appended when the painted value CHANGED, so a bar that popped
+      // straight to 100% at the end leaves exactly one entry behind.
+      if (widths.length < EXPECTED.downloads.minPaintedWidths) {
+        throw evidenceError(`the bar was painted at ${widths.length} distinct width(s) (${widths.join(',')}) - a progress bar that only appears at the end is not one`, { widths, download: state.download });
+      }
+      for (let i = 1; i < widths.length; i += 1) {
+        if (widths[i] <= widths[i - 1]) throw evidenceError(`the painted widths do not grow: ${widths.join(',')}`, { widths });
+      }
+      if (widths[widths.length - 1] !== 100) throw evidenceError(`the bar finished at ${widths[widths.length - 1]}%, expected 100%`, { widths });
+
+      const ui = await ctx.popup.evaluate(() => ({
+        hidden: document.getElementById('progress').hidden,
+        width: document.getElementById('progressBar').style.width,
+        failed: document.getElementById('progressBar').classList.contains('failed'),
+        text: document.getElementById('progressText').textContent
+      }));
+      if (ui.hidden) throw evidenceError('the progress section is hidden after a run that just finished', ui);
+      if (ui.width !== '100%') throw evidenceError(`the bar is ${ui.width} wide, expected 100%`, ui);
+      if (ui.failed) throw evidenceError('the bar is showing the failure colour after a run where nothing failed', ui);
+      const total = EXPECTED.downloads.mixedTotal;
+      if (!ui.text.includes(`${total}/${total}`) || !/retried/.test(ui.text)) {
+        throw evidenceError(`the progress text reads "${ui.text}", expected it to name ${total}/${total} files and the retry`, ui);
+      }
+      return `${events.length} events received, bar painted at ${widths.join('% -> ')}%, reading "${ui.text}"`;
+    }
+  },
+  {
+    title: 'a download that keeps failing is reported as failed, and the rest of the batch still lands',
+    run: async () => {
+      await swEval(() => chrome.storage.local.remove('settings'));
+      ctx.batch = await ctx.browser.newPage();
+      watch(ctx.batch, 'download batch fixture');
+      const url = ctx.server.origin + '/downloads.html';
+      await ctx.batch.bringToFront();
+      await ctx.batch.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      const fixture = await ctx.batch.evaluate(() => window.__FIXTURE__);
+      const tabId = await resolveTabId(url);
+      if (tabId < 0) throw new Error('could not resolve the download batch tab');
+
+      // Non-vacuity: the doomed image has to have RENDERED. If it had failed for the
+      // page too, the download failure below could have come from anywhere, and the
+      // page would also be logging a console error the last step would trip over.
+      if (fixture.doomedLoaded !== true || fixture.brokenImages !== 0) {
+        throw evidenceError('the fixture image that is supposed to work exactly once never rendered', { fixture, server: ctx.server.stats() });
+      }
+
+      const before = await swEval(() => chrome.downloads.search({}).then(i => i.length));
+      const data = await bulkWith(tabId, null);
+      ctx.lastDiag = { data, fixture, server: ctx.server.stats() };
+      expect(data.planned, EXPECTED.downloads.batchTotal, 'images queued');
+      expect(data.downloaded, EXPECTED.downloads.batchDone, 'images that reached disk');
+      expect(data.failed, EXPECTED.downloads.batchFailed, 'images reported as failed');
+
+      // A count is not a report. "1 failed" that cannot say which file or why is
+      // exactly the kind of evidence-free result this project keeps calling out.
+      const failure = (data.failures || [])[0];
+      if (!failure || !failure.url.includes('/once/')) {
+        throw evidenceError('the failed download was not reported with its url', data.failures);
+      }
+      if (failure.errorCode !== 'SERVER_FAILED' || !failure.error) {
+        throw evidenceError(`the failure came back as ${JSON.stringify(failure.errorCode)} with error ${JSON.stringify(failure.error)}`, failure);
+      }
+      expect(failure.attempts, DEFAULT_RETRY_OPTIONS.maxAttempts, 'attempts spent on a file that never worked');
+      if (!data.downloadWarning || !/could not be downloaded/.test(data.downloadWarning)) {
+        throw evidenceError('a batch that lost a file came back without a warning', data);
+      }
+      const doomedRequests = ctx.server.stats()[fixture.doomed];
+      if (!doomedRequests || doomedRequests.failures !== DEFAULT_RETRY_OPTIONS.maxAttempts) {
+        throw evidenceError(`the fixture served ${doomedRequests ? doomedRequests.failures : 0} failures for the doomed image, expected ${DEFAULT_RETRY_OPTIONS.maxAttempts}`, ctx.lastDiag);
+      }
+
+      await waitFor(`${EXPECTED.downloads.batchDone} healthy downloads to complete`, async () => {
+        ctx.downloads = await swEval(() => chrome.downloads.search({}));
+        return ctx.downloads.filter(i => i.state === 'complete').length >= before + EXPECTED.downloads.batchDone;
+      }, { timeout: DOWNLOAD_TIMEOUT_MS, snapshot: async () => describeDownloads(ctx.downloads) });
+      const written = await expectFilesOnDisk(data.ids, EXPECTED.downloads.batchDone, 'partial batch');
+
+      // The badge is the menu user's only feedback, and "2" would be a lie here.
+      const badge = await swEval(() => chrome.action.getBadgeText({}));
+      if (badge !== `${EXPECTED.downloads.batchDone}/${EXPECTED.downloads.batchTotal}`) {
+        throw evidenceError(`the badge reads ${badge}, expected ${EXPECTED.downloads.batchDone}/${EXPECTED.downloads.batchTotal} - a partial batch must not look complete`, { badge, data });
+      }
+      return `${written.count} of ${data.planned} landed (${written.bytes}B), 1 lost after ${failure.attempts} attempts: ${failure.error}; badge ${badge}`;
     }
   },
   {
