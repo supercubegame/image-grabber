@@ -27,7 +27,7 @@ export const EXPECTED = {
   // colours from its own background, so it passed with the list completely broken.
   // Only the difference between the two screenshots can come from thumbnails.
   //
-  // Measured in CI: 395 empty -> 1851 populated, delta 1456. The floor keeps ~3.6x
+  // Measured in CI: 445 empty -> 1908 populated, delta 1463. The floor keeps ~3.6x
   // margin; it is here to catch "nothing rendered", not to benchmark the renderer.
   // Add or remove a fixture thumbnail and this moves with defaultVisible.
   minColorDelta: 400,
@@ -74,10 +74,14 @@ export const EXPECTED = {
     // How long the browser gate waits for downloads to reach a terminal state.
     // Lives here rather than in verify-e2e.js so the FAST gate can check it against
     // worstCaseItemMs(): one bad file must fail the gate, never time it out.
-    gateTimeoutMs: 40000,
+    //
+    // A CEILING, not a spend - nothing waits this long unless something is broken.
+    // It went 40000 -> 60000 when maxAttempts went 3 -> 4, because the worst case a
+    // single file can cost is now 4 x 12000 + 3000 = 51000ms.
+    gateTimeoutMs: 60000,
 
     // /flaky/2/... 500s twice, then serves the image. This MUST stay strictly below
-    // maxAttempts (3) or the retry check would quietly be asserting a give-up.
+    // maxAttempts (4) or the retry check would quietly be asserting a give-up.
     flakyFailures: 2,
     flakyAttempts: 3,
 

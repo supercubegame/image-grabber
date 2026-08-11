@@ -15,6 +15,7 @@ import {
   mergeRetryOptions,
   classifyFailure,
   backoffSchedule,
+  uncappedBackoffSchedule,
   worstCaseItemMs,
   runDownloads
 } from '../src/core/retry.js';
@@ -28,6 +29,9 @@ const UNIT_DIR = path.join(ROOT, 'test', 'unit');
 // notice when a file stops being discovered.
 const MIN_UNIT_FILES = 7;
 const MIN_UNIT_TESTS = 42;
+// AGENTS.md says to keep itself under 200 lines, because past that the model it is
+// written for starts skimming. It had drifted to 220 before anything checked.
+const MAX_RULES_LINES = 200;
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -107,6 +111,25 @@ report.check('src/core stays pure (no DOM, chrome API, clock or unseeded randomn
   }
   if (hits.length) throw fail(`core is not pure any more (${hits.length} offending lines)`, hits.join('\n'));
   return `${files.length} core file(s) clean`;
+});
+
+// The rules file is the handover to the next agent, and it has two properties that
+// only ever degrade quietly: it gets longer, and its copy drifts. Both are cheap to
+// check and neither was checked until one of them had already broken.
+report.check('the rules files stay short and the two copies stay identical', () => {
+  const agents = read('AGENTS.md');
+  const claude = read('CLAUDE.md');
+  const lines = agents.trimEnd().split('\n').length;
+  if (lines > MAX_RULES_LINES) {
+    throw fail(`AGENTS.md is ${lines} lines, over its own ${MAX_RULES_LINES}-line limit - cut or split it`, agents.trimEnd().split('\n').map((l, i) => `${i + 1}: ${l}`).slice(-12).join('\n'));
+  }
+  if (agents !== claude) {
+    const a = agents.split('\n');
+    const c = claude.split('\n');
+    const at = a.findIndex((line, i) => line !== c[i]);
+    throw fail(`CLAUDE.md is not a copy of AGENTS.md - they diverge at line ${at + 1}`, `AGENTS.md: ${a[at]}\nCLAUDE.md: ${c[at] === undefined ? '(file ends here)' : c[at]}`);
+  }
+  return `${lines} lines (limit ${MAX_RULES_LINES}), CLAUDE.md identical`;
 });
 
 // Both download triggers - the popup button and the page context menu - build
@@ -246,6 +269,29 @@ report.check('the retry budgets line up with each other and with the browser gat
   }
   if (problems.length) throw fail(`${problems.length} retry budget(s) do not line up`, problems.join('\n'));
   return `${options.maxAttempts} attempts, waits ${schedule.join('+')}ms (cap ${options.backoffMaxMs}), worst file ${worstItem}ms < gate ${EXPECTED.downloads.gateTimeoutMs}ms, run budget ${options.runTimeoutMs}ms`;
+});
+
+// A cap the schedule can never reach is a constant with a comment attached. This
+// one sat at 4000ms against a schedule that stopped at 1000ms and no assertion had
+// anything to say about it, which is the same shape of hole as the colour floor:
+// green, permanent, and invisible until somebody does the arithmetic by hand.
+report.check('the backoff cap is a real bound on the DEFAULT schedule, not decoration', () => {
+  const options = mergeRetryOptions(null);
+  const capped = backoffSchedule(options);
+  const uncapped = uncappedBackoffSchedule(options);
+  const clipped = capped.filter((ms, i) => uncapped[i] > ms);
+  if (!clipped.length) {
+    throw fail(
+      `backoffMaxMs is ${options.backoffMaxMs}ms but the schedule tops out at ${Math.max(...uncapped)}ms - the cap can never fire, so it proves nothing and protects nothing`,
+      `capped:   ${capped.join(', ')}\nuncapped: ${uncapped.join(', ')}\nlower the cap below ${Math.max(...uncapped)}ms, or raise maxAttempts until the schedule reaches it`
+    );
+  }
+  // The other direction: a cap so low that even the first retry is clipped means
+  // there is no growth left to observe, and "exponential backoff" is a fixed delay.
+  if (capped[0] !== uncapped[0] || capped.length < 2 || capped[1] <= capped[0]) {
+    throw fail(`the cap clips from the very first wait (${capped.join(', ')}), which flattens the backoff into a fixed delay`, `uncapped: ${uncapped.join(', ')}`);
+  }
+  return `waits ${capped.join('/')}ms - ${clipped.length} of ${capped.length} clipped by the ${options.backoffMaxMs}ms cap (uncapped: ${uncapped.join('/')}ms)`;
 });
 
 report.check('png codec round-trips (the gate\'s own screenshot tooling)', () => {

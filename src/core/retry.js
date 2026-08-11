@@ -75,11 +75,18 @@ export const MAX_SAFE_BACKOFF_MS = 10000;
 
 // These six move as one group. The fast gate checks the relationships; AGENTS.md
 // spells out which ones and why.
+//
+// On backoffMaxMs: a cap only means anything if the schedule can REACH it, i.e. if
+// it sits below backoffBaseMs x backoffFactor^(maxAttempts - 2). With 4 attempts,
+// 500ms and a factor of 2 the waits would run 500/1000/2000, so 1500 is what makes
+// the last one a clipped wait rather than a decorative constant. It sat at 4000
+// with 3 attempts for a while and could never fire; the fast gate now proves the
+// default schedule is genuinely clipped.
 export const DEFAULT_RETRY_OPTIONS = Object.freeze({
-  maxAttempts: 3,
+  maxAttempts: 4,
   backoffBaseMs: 500,
   backoffFactor: 2,
-  backoffMaxMs: 4000,
+  backoffMaxMs: 1500,
   perDownloadTimeoutMs: 12000,
   runTimeoutMs: 300000
 });
@@ -130,6 +137,14 @@ export function backoffSchedule(options) {
   const waits = [];
   for (let attempt = 1; attempt < config.maxAttempts; attempt += 1) waits.push(backoffFor(attempt, config));
   return waits;
+}
+
+// The same schedule with the cap lifted. Only the gate uses it, and only to prove
+// the cap is load-bearing: if this comes back identical to backoffSchedule(), the
+// cap can never fire and is decoration. Exported rather than recomputed in the gate
+// so the growth formula lives in exactly one place.
+export function uncappedBackoffSchedule(options) {
+  return backoffSchedule({ ...mergeRetryOptions(options), backoffMaxMs: Number.MAX_SAFE_INTEGER });
 }
 
 // Worst case for a SINGLE file: every attempt burns its whole deadline and every
