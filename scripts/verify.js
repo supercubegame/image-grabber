@@ -32,6 +32,7 @@ const MIN_UNIT_TESTS = 56;
 // AGENTS.md says to keep itself under 200 lines, because past that the model it is
 // written for starts skimming. It had drifted to 220 before anything checked.
 const MAX_RULES_LINES = 200;
+const WORKFLOW = '.github/workflows/verify.yml';
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -130,6 +131,62 @@ report.check('the rules files stay short and the two copies stay identical', () 
     throw fail(`CLAUDE.md is not a copy of AGENTS.md - they diverge at line ${at + 1}`, `AGENTS.md: ${a[at]}\nCLAUDE.md: ${c[at] === undefined ? '(file ends here)' : c[at]}`);
   }
   return `${lines} lines (limit ${MAX_RULES_LINES}), CLAUDE.md identical`;
+});
+
+// Run #51: both gates green and not one comment anywhere. The report job's
+// actions/checkout failed TLS verification and exited 128 before the write-back
+// could run, so from outside the repo the commit looked verified while nothing and
+// nobody could read a result. A report that does not arrive did not run.
+//
+// The fix has four load-bearing parts and every one of them is invisible when it
+// breaks, which is exactly why they are asserted here instead of merely written
+// down: no clone in that job, a fallback comment seeded before anything that can
+// fail, retries on both the fetch and the post, and a degraded report that says so.
+report.check('the report job cannot be silenced by a clone, a blip or a missing composer', () => {
+  const wf = read(WORKFLOW);
+  const jobs = {};
+  let current = null;
+  let inJobs = false;
+  for (const line of wf.split('\n')) {
+    if (/^jobs:\s*$/.test(line)) { inJobs = true; continue; }
+    if (!inJobs) continue;
+    const m = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
+    if (m) { current = m[1]; jobs[current] = []; continue; }
+    if (current) jobs[current].push(line);
+  }
+  const summary = jobs.summary ? jobs.summary.join('\n') : null;
+  if (!summary) throw fail(`no \`summary:\` job in ${WORKFLOW} - renamed, or this parse is broken`, `jobs found: ${Object.keys(jobs).join(', ') || 'none'}`);
+  // Negative twin. An empty or mis-sliced block satisfies every "does not contain"
+  // assertion below for free, so prove the parse works first: the two gate jobs DO
+  // check the repo out, and have to.
+  for (const name of ['fast', 'e2e']) {
+    const block = jobs[name] ? jobs[name].join('\n') : '';
+    if (!block.includes('actions/checkout')) {
+      throw fail(`the \`${name}\` job block contains no actions/checkout, so the workflow parse is wrong and the assertions below prove nothing`, `jobs found: ${Object.keys(jobs).join(', ')}\n---- ${name} block ----\n${block.slice(0, 500)}`);
+    }
+  }
+  const problems = [];
+  if (summary.includes('actions/checkout')) {
+    problems.push('the report job checks the repo out again: that is the step that exited 128 in run #51 and took the whole report with it. It needs two script files, not a working tree.');
+  }
+  const seedAt = summary.indexOf('> comment.md');
+  const postAt = summary.indexOf('      - name: post report');
+  if (seedAt === -1) problems.push('nothing writes a fallback comment.md, so a composer that fails to load leaves the job with nothing to post');
+  if (postAt === -1) problems.push('the `post report` step is gone or renamed - nothing writes the result back');
+  if (seedAt !== -1 && postAt !== -1 && seedAt > postAt) {
+    problems.push('the fallback comment.md is written AFTER the post step, which is the same as not writing it at all');
+  }
+  if (!/--retry\b/.test(summary)) problems.push('the composer fetch carries no --retry, so a single transient blip silences the report exactly as before');
+  if (!summary.includes('report-degraded.flag')) problems.push('nothing marks a degraded report: a comment carrying only job results must never read like a complete one');
+  if (postAt !== -1) {
+    const end = summary.indexOf('\n      - name:', postAt + 1);
+    const postStep = end === -1 ? summary.slice(postAt) : summary.slice(postAt, end);
+    if (/continue-on-error:\s*true/.test(postStep)) problems.push('the post step is continue-on-error: a monitor allowed to fail quietly is worse than no monitor');
+    if (!/for \(let attempt/.test(postStep)) problems.push('the post step does not retry, and posting is a network call like any other');
+    if (!/readback/.test(postStep)) problems.push('the post step never reads the comment back: an accepted API call is not a comment anybody can read');
+  }
+  if (problems.length) throw fail(`${problems.length} way(s) the report could go missing again`, problems.join('\n'));
+  return 'report job: no checkout, fallback comment seeded before the post, fetch retried, post retried and read back, degraded reports flagged red';
 });
 
 // An injected classic script cannot import the core, so the element limit exists
