@@ -79,16 +79,17 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
-  # There is deliberately NO actions/checkout in this job.
+  # ==========================================================================
+  # 回写报告。这个 job 和 supercubegame/jumpwow 的同名 job 是同一份结构：
+  # 一样的步骤、一样的 id、一样的中文步骤名。两边各写各的，几轮之后就会各自漂。
   #
-  # Run #51: both gates green, and not one comment anywhere. git failed TLS
-  # verification and exited 128 in the checkout step, taking the entire write-back
-  # with it. From outside the repo the run looked like it had happened; nobody and
-  # nothing could read a result. This job needs two script files, not a working
-  # tree, so it fetches exactly those two over the API with retries.
+  # 这里**故意没有** actions/checkout。run #51：两条闸门全绿，clone 死在 git
+  # 证书校验（exit 128），把整条回写一起带走，那次提交上一条评论都没有。从仓库
+  # 外面看像是「跑过了」。这个 job 要的是两个脚本文件，不是一棵工作树。
   #
-  # See "A report that does not arrive did not run" in AGENTS.md. The fast gate
-  # asserts the shape of this job, so the rule cannot quietly come undone.
+  # 每一步都有稳定的 id，闸门按 id 定位它们,显示名是装饰，改名不该把断言弄哑。
+  # 但显示名同时也被断言成精确值，所以在这个仓库里改名会立刻红。
+  # ==========================================================================
   summary:
     name: report
     if: always()
@@ -103,39 +104,40 @@ jobs:
         with:
           node-version: '20'
 
-      - name: download reports
+      - name: 下载闸门报告
+        id: download
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           path: reports
           pattern: report-*
 
-      # Seeded before anything that can fail, on EVERY run, so the degraded path is
-      # executed every time instead of being a branch nobody has ever walked. The
-      # composer overwrites comment.md when it loads; the flag file is how the steps
-      # below tell which of the two they are holding.
-      - name: seed a fallback comment
+      # 在任何会失败的步骤之前种下，每次都跑。这样「降级」这条支路是每一次运行
+      # 都真的走过的，而不是一条从来没被执行过、需要的时候才发现是坏的分支。
+      # composer 起来了就把它覆盖掉；下面的步骤靠 flag 文件区分手里拿的是哪一份。
+      - name: 种下兜底评论
+        id: seed
         shell: bash
         run: |
           set -uo pipefail
           touch report-degraded.flag
           {
-            echo "⚠️ **report degraded** — the composer never loaded, so this carries the"
-            echo "job-level result only, with no per-check evidence."
+            echo "⚠️ **报告降级** — composer 没能加载，所以这条评论只有 job 级别的"
+            echo "结果，没有逐项证据。"
             echo ""
-            echo "| gate | job result |"
+            echo "| 闸门 | job 结果 |"
             echo "| --- | --- |"
             echo "| fast gate | \`${{ needs.fast.result }}\` |"
             echo "| browser gate | \`${{ needs.e2e.result }}\` |"
             echo ""
-            echo "commit \`${GITHUB_SHA:0:7}\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            echo "提交 \`${GITHUB_SHA:0:7}\` · [完整日志]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
           } > comment.md
           found=0
           while IFS= read -r log; do
             found=$((found + 1))
             {
               echo ""
-              echo "<details><summary>last 80 lines of $(basename "$log")</summary>"
+              echo "<details><summary>$(basename "$log") 末尾 80 行</summary>"
               echo ""
               echo '```'
               tail -n 80 "$log"
@@ -145,16 +147,16 @@ jobs:
             } >> comment.md
           done < <(find reports -name 'stdout-*.log' 2>/dev/null | sort)
           if [ "$found" -eq 0 ]; then
-            printf '\nNo gate stdout logs were downloaded either, so this broke before the gates produced anything - look at the workflow, not the gates.\n' >> comment.md
+            printf '\n连闸门的 stdout 日志都没下载到，说明这次在闸门产出任何东西之前就断了 - 去看 workflow，不是看闸门。\n' >> comment.md
           fi
 
-      # Two files over HTTPS instead of a clone, pinned to the commit under test so
-      # the composer always matches the code it is reporting on. --retry-all-errors
-      # covers the transient network class that took run #51 down.
+      # 两个文件走 HTTPS，而不是整仓 clone，并且 pin 在被测的那个 commit 上，
+      # 保证 composer 和它正在汇报的代码是同一版。--retry-all-errors 覆盖的就是
+      # 把 run #51 干掉的那一类偶发网络错误。
       #
-      # scripts/package.json is written here because without a checkout there is no
-      # root package.json, and node would parse these ESM files as CommonJS.
-      - name: fetch the composer
+      # scripts/package.json 是这里现写的：没有 checkout 就没有根 package.json，
+      # node 会把这两个 ESM 文件当 CommonJS 解析。
+      - name: 取 composer
         id: fetch
         continue-on-error: true
         shell: bash
@@ -175,7 +177,7 @@ jobs:
             test -s "$f"
           done
 
-      - name: compose the report
+      - name: 合成报告
         id: compose
         continue-on-error: true
         shell: bash
@@ -185,9 +187,10 @@ jobs:
           test -s comment.md
           rm -f report-degraded.flag
 
-      # NOT continue-on-error, and it must never become it: a write-back allowed to
-      # fail quietly is precisely what run #51 looked like from the outside.
-      - name: post report
+      # 这一步**不是** continue-on-error，也永远不许改成 continue-on-error：
+      # 一个允许自己静默失败的回写，从外面看起来就是 run #51 的样子。
+      - name: 回写报告
+        id: post
         uses: actions/github-script@v7
         with:
           retries: 3
@@ -199,13 +202,15 @@ jobs:
             const body = marker + '\n' + text;
             const { owner, repo } = context.repo;
 
-            // Job summary first. If every attempt below fails, the evidence is at
-            // least on the run page for a human.
+            // 先写 job summary。就算下面每次尝试都失败，证据至少还留在 run
+            // 页面上，人能看到。
             await core.summary.addRaw(text).write();
 
             const sleep = ms => new Promise(r => setTimeout(r, ms));
 
             async function postOnce() {
+              // 从 commit 反查 PR。不读 context.payload.pull_request：那要求
+              // workflow 挂在 pull_request 事件上，而挂上去就会每次跑两遍。
               const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
                 owner, repo, commit_sha: context.sha
               });
@@ -218,19 +223,19 @@ jobs:
                 const result = existing
                   ? await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
                   : await github.rest.issues.createComment({ owner, repo, issue_number: open.number, body });
-                // An accepted API call is not a comment anyone can read; read it back.
+                // 接口收下了不等于有人读得到这条评论，读回来确认一遍。
                 const readback = await github.rest.issues.getComment({ owner, repo, comment_id: result.data.id });
-                if (!readback.data.body.includes(marker)) throw new Error('read-back of the PR comment did not contain the marker');
-                return `PR #${open.number} (comment ${result.data.id})`;
+                if (!readback.data.body.includes(marker)) throw new Error('PR 评论读回后没有标记');
+                return `PR #${open.number}（评论 ${result.data.id}）`;
               }
-              // The no-PR branch. It is the one that has to work when a push lands on
-              // main, which is exactly when nobody is watching.
+              // 没有 PR 的那条支路。直接 push 到 main 时靠的就是它,而那正是
+              // 没人盯着的时候。
               const result = await github.rest.repos.createCommitComment({
                 owner, repo, commit_sha: context.sha, body
               });
               const readback = await github.rest.repos.getCommitComment({ owner, repo, comment_id: result.data.id });
-              if (!readback.data.body.includes(marker)) throw new Error('read-back of the commit comment did not contain the marker');
-              return `commit ${context.sha.slice(0, 7)} (comment ${result.data.id})`;
+              if (!readback.data.body.includes(marker)) throw new Error('commit 评论读回后没有标记');
+              return `commit ${context.sha.slice(0, 7)}（评论 ${result.data.id}）`;
             }
 
             let posted = null;
@@ -240,17 +245,18 @@ jobs:
                 posted = await postOnce();
               } catch (err) {
                 last = err;
-                core.warning(`post attempt ${attempt} failed: ${err.message}`);
+                core.warning(`第 ${attempt} 次回写失败：${err.message}`);
                 if (attempt < 4) await sleep(2000 * attempt);
               }
             }
-            if (!posted) throw new Error(`the report could not be written back after 4 attempts: ${last && last.message}`);
-            core.info(`report posted to ${posted}`);
-            if (degraded) core.setFailed('the report was posted in DEGRADED form: the composer never loaded, so the comment carries job results only');
+            if (!posted) throw new Error(`重试 4 次仍然没能把报告写回去：${last && last.message}`);
+            core.info(`报告已送达 ${posted}`);
+            if (degraded) core.setFailed('报告是以降级形式送出的：composer 没加载，评论里只有 job 结果，没有逐项证据');
 
-      # The verdict is computed from the job results, so it survives a composer that
-      # never arrived. --check runs on top of that when the composer IS present.
-      - name: fail if a gate failed or the report was degraded
+      # 判定从 job 结果算，所以 composer 没到位也照样成立。composer 在的时候
+      # 再用 --check 复核一遍。
+      - name: 闸门失败或报告降级则失败
+        id: verdict
         if: always()
         shell: bash
         run: |
@@ -260,7 +266,7 @@ jobs:
             if [ "${pair##*:}" != "success" ]; then echo "${pair%%:*}: ${pair##*:}"; rc=1; fi
           done
           if [ -f report-degraded.flag ]; then
-            echo "the composer never loaded; the posted comment has no per-check evidence"
+            echo "composer 没能加载，送出去的评论里没有逐项证据"
             rc=1
           fi
           if [ -f scripts/compose-report.js ]; then
