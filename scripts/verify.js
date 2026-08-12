@@ -33,21 +33,17 @@ const MIN_UNIT_TESTS = 56;
 // written for starts skimming. It had drifted to 220 before anything checked.
 const MAX_RULES_LINES = 200;
 const WORKFLOW = '.github/workflows/verify.yml';
-// The report job, step by step. supercubegame/jumpwow has the same job with the same
-// ids and the same names - two repos writing it separately is how they drift.
+// The report job lives in supercubegame/ci-workflows and jumpwow calls the same
+// file. Two byte-identical copies had nothing guarding them - this gate can only
+// ever see THIS repo's workflow, so "both repos edited" reads as green while the
+// two diverge. One file removes the question; this constant is what keeps this
+// repo pointed at it.
 //
-// The gate locates steps by ID. A display name is a label; an assertion keyed on a
-// label turns "rename a step" into "break the gate", which is exactly the tail
-// wagging the dog that made the names English here and Chinese there in the first
-// place. Names are asserted separately, so a rename goes red on purpose.
-const REPORT_STEPS = [
-  { id: 'download', name: '下载闸门报告' },
-  { id: 'seed', name: '种下兜底评论' },
-  { id: 'fetch', name: '取 composer' },
-  { id: 'compose', name: '合成报告' },
-  { id: 'post', name: '回写报告' },
-  { id: 'verdict', name: '闸门失败或报告降级则失败' }
-];
+// The ref is `@main` deliberately. Pin a SHA and version drift walks straight back
+// in: this repo on an old commit, jumpwow on a new one, both green, behaving
+// differently. See the README in that repo for the cost side of the trade.
+const SHARED_REPORT_WORKFLOW = 'supercubegame/ci-workflows/.github/workflows/report.yml@main';
+const REQUIRED_REPORT_INPUTS = ['node-version', 'gates', 'composer-files', 'composer-entry', 'marker'];
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -148,36 +144,16 @@ report.check('the rules files stay short and the two copies stay identical', () 
   return `${lines} lines (limit ${MAX_RULES_LINES}), CLAUDE.md identical`;
 });
 
-// Split a job block into its steps. A step starts at six spaces + "- "; its id and
-// name live inside it. Locating steps by id is the point: see REPORT_STEPS.
-function parseSteps(block) {
-  const steps = [];
-  let cur = null;
-  for (const line of block.split('\n')) {
-    if (/^ {6}- \S/.test(line)) {
-      cur = { name: null, id: null, lines: [] };
-      steps.push(cur);
-    }
-    if (!cur) continue;
-    cur.lines.push(line);
-    const named = /^ {6}- name:\s*(.+?)\s*$/.exec(line);
-    if (named) cur.name = named[1];
-    const identified = /^ {8}id:\s*(\S+)\s*$/.exec(line);
-    if (identified) cur.id = identified[1];
-  }
-  return steps.map((s, i) => ({ ...s, index: i, text: s.lines.join('\n') }));
-}
-
 // Run #51: both gates green and not one comment anywhere. The report job's
 // actions/checkout failed TLS verification and exited 128 before the write-back
 // could run, so from outside the repo the commit looked verified while nothing and
 // nobody could read a result. A report that does not arrive did not run.
 //
-// The fix has four load-bearing parts and every one of them is invisible when it
-// breaks, which is exactly why they are asserted here instead of merely written
-// down: no clone in that job, a fallback comment seeded before anything that can
-// fail, retries on both the fetch and the post, and a degraded report that says so.
-report.check('the report job cannot be silenced by a clone, a blip or a missing composer', () => {
+// That job now lives in supercubegame/ci-workflows and jumpwow calls the same file,
+// so its internals are asserted there, not here. What THIS gate can still see - and
+// therefore has to hold - is that this repo really delegates: the exact `uses:`
+// line, no local steps grown back, and inputs that carry real values.
+report.check('the report job is the shared workflow, not a local copy that can drift', () => {
   const wf = read(WORKFLOW);
   const jobs = {};
   let current = null;
@@ -201,53 +177,45 @@ report.check('the report job cannot be silenced by a clone, a blip or a missing 
     }
   }
 
-  const steps = parseSteps(summary);
-  const byId = new Map(steps.filter(s => s.id).map(s => [s.id, s]));
   const problems = [];
-
+  const uses = /^ {4}uses:\s*(\S+)\s*$/m.exec(summary);
+  if (!uses) {
+    problems.push(`the report job has no \`uses:\` line - it is a local job again, and a local copy is exactly what nothing can guard: this gate cannot see jumpwow's copy, so both drifting apart stays green`);
+  } else if (uses[1] !== SHARED_REPORT_WORKFLOW) {
+    const sameFile = uses[1].split('@')[0] === SHARED_REPORT_WORKFLOW.split('@')[0];
+    problems.push(sameFile
+      ? `the report job calls the shared workflow at \`@${uses[1].split('@')[1]}\`, expected \`@main\` - pinning a ref is how the two repos end up on different versions of it, both green and behaving differently`
+      : `the report job calls ${uses[1]}, expected ${SHARED_REPORT_WORKFLOW}`);
+  }
+  // A job cannot have both `uses:` and `steps:`, so this catches the copy coming
+  // back under a different shape rather than an impossible file.
+  if (/^ {4}steps:/m.test(summary)) {
+    problems.push('the report job has its own `steps:` again - that is the local copy returning, whatever it is called');
+  }
   if (summary.includes('actions/checkout')) {
-    problems.push('the report job checks the repo out again: that is the step that exited 128 in run #51 and took the whole report with it. It needs two script files, not a working tree.');
+    problems.push('the report job checks the repo out: that is the step that exited 128 in run #51 and took the whole report with it');
   }
-
-  // Structure first, by id. Labels come second - see the REPORT_STEPS comment.
-  for (const want of REPORT_STEPS) {
-    const step = byId.get(want.id);
-    if (!step) {
-      problems.push(`no step with \`id: ${want.id}\` in the report job - the gate finds steps by id, so a missing one means the structure changed, not just a label`);
-      continue;
-    }
-    if (step.name !== want.name) {
-      problems.push(`the step \`id: ${want.id}\` is named ${JSON.stringify(step.name)}, expected ${JSON.stringify(want.name)} - jumpwow's report job uses these exact names, and renaming one here is how the two repos start diverging`);
+  for (const input of REQUIRED_REPORT_INPUTS) {
+    if (!new RegExp(`^ {6}${input}:`, 'm').test(summary)) {
+      problems.push(`the report job passes no \`${input}:\` - the shared workflow requires it and the run would fail before posting anything`);
     }
   }
-
-  const seed = byId.get('seed');
-  const fetchStep = byId.get('fetch');
-  const post = byId.get('post');
-
-  if (seed && !seed.text.includes('> comment.md')) {
-    problems.push('the `seed` step does not write comment.md, so a composer that fails to load leaves the job with nothing to post');
+  // The one input that can look right and be hollow. `gates:` is where the final
+  // verdict is computed from, so a hardcoded "result":"success" in there would keep
+  // every run green no matter what the gates did - and the posted comment would
+  // still read like a complete report. Demand the real expressions by name.
+  const gatesLine = /^ {6}gates:\s*(.+)$/m.exec(summary);
+  if (gatesLine) {
+    for (const need of ['needs.fast.result', 'needs.e2e.result']) {
+      if (!gatesLine[1].includes(need)) {
+        problems.push(`\`gates:\` does not read \`${need}\` - the verdict is computed from this input, so a literal value here makes the whole run unfalsifiable`);
+      }
+    }
   }
-  if (seed && post && seed.index > post.index) {
-    problems.push('the fallback comment.md is written AFTER the post step, which is the same as not writing it at all');
-  }
-  if (fetchStep && !/--retry\b/.test(fetchStep.text)) {
-    problems.push('the `fetch` step carries no --retry, so a single transient blip silences the report exactly as before');
-  }
-  if (!summary.includes('report-degraded.flag')) {
-    problems.push('nothing marks a degraded report: a comment carrying only job results must never read like a complete one');
-  }
-  if (post) {
-    if (/continue-on-error:\s*true/.test(post.text)) problems.push('the post step is continue-on-error: a monitor allowed to fail quietly is worse than no monitor');
-    if (!/for \(let attempt/.test(post.text)) problems.push('the post step does not retry, and posting is a network call like any other');
-    if (!/readback/.test(post.text)) problems.push('the post step never reads the comment back: an accepted API call is not a comment anybody can read');
-  }
-
   if (problems.length) {
-    const seen = steps.map(s => `${s.id || '(no id)'} — ${s.name === null ? '(no name)' : s.name}`).join('\n');
-    throw fail(`${problems.length} way(s) the report could go missing again`, `${problems.join('\n')}\n---- steps found in the report job ----\n${seen}`);
+    throw fail(`${problems.length} problem(s) with the report job`, `${problems.join('\n')}\n---- summary job ----\n${summary}`);
   }
-  return `${REPORT_STEPS.length} steps found by id with the expected names; no checkout, fallback seeded before the post, fetch retried, post retried and read back, degraded reports flagged red`;
+  return `delegates to ${SHARED_REPORT_WORKFLOW}; no local steps, no checkout, ${REQUIRED_REPORT_INPUTS.length} inputs present, gates reads both needs.*.result`;
 });
 
 // An injected classic script cannot import the core, so the element limit exists
