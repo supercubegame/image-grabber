@@ -33,6 +33,21 @@ const MIN_UNIT_TESTS = 56;
 // written for starts skimming. It had drifted to 220 before anything checked.
 const MAX_RULES_LINES = 200;
 const WORKFLOW = '.github/workflows/verify.yml';
+// The report job, step by step. supercubegame/jumpwow has the same job with the same
+// ids and the same names - two repos writing it separately is how they drift.
+//
+// The gate locates steps by ID. A display name is a label; an assertion keyed on a
+// label turns "rename a step" into "break the gate", which is exactly the tail
+// wagging the dog that made the names English here and Chinese there in the first
+// place. Names are asserted separately, so a rename goes red on purpose.
+const REPORT_STEPS = [
+  { id: 'download', name: '下载闸门报告' },
+  { id: 'seed', name: '种下兜底评论' },
+  { id: 'fetch', name: '取 composer' },
+  { id: 'compose', name: '合成报告' },
+  { id: 'post', name: '回写报告' },
+  { id: 'verdict', name: '闸门失败或报告降级则失败' }
+];
 
 const report = new Report('fast gate');
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -133,6 +148,26 @@ report.check('the rules files stay short and the two copies stay identical', () 
   return `${lines} lines (limit ${MAX_RULES_LINES}), CLAUDE.md identical`;
 });
 
+// Split a job block into its steps. A step starts at six spaces + "- "; its id and
+// name live inside it. Locating steps by id is the point: see REPORT_STEPS.
+function parseSteps(block) {
+  const steps = [];
+  let cur = null;
+  for (const line of block.split('\n')) {
+    if (/^ {6}- \S/.test(line)) {
+      cur = { name: null, id: null, lines: [] };
+      steps.push(cur);
+    }
+    if (!cur) continue;
+    cur.lines.push(line);
+    const named = /^ {6}- name:\s*(.+?)\s*$/.exec(line);
+    if (named) cur.name = named[1];
+    const identified = /^ {8}id:\s*(\S+)\s*$/.exec(line);
+    if (identified) cur.id = identified[1];
+  }
+  return steps.map((s, i) => ({ ...s, index: i, text: s.lines.join('\n') }));
+}
+
 // Run #51: both gates green and not one comment anywhere. The report job's
 // actions/checkout failed TLS verification and exited 128 before the write-back
 // could run, so from outside the repo the commit looked verified while nothing and
@@ -165,28 +200,54 @@ report.check('the report job cannot be silenced by a clone, a blip or a missing 
       throw fail(`the \`${name}\` job block contains no actions/checkout, so the workflow parse is wrong and the assertions below prove nothing`, `jobs found: ${Object.keys(jobs).join(', ')}\n---- ${name} block ----\n${block.slice(0, 500)}`);
     }
   }
+
+  const steps = parseSteps(summary);
+  const byId = new Map(steps.filter(s => s.id).map(s => [s.id, s]));
   const problems = [];
+
   if (summary.includes('actions/checkout')) {
     problems.push('the report job checks the repo out again: that is the step that exited 128 in run #51 and took the whole report with it. It needs two script files, not a working tree.');
   }
-  const seedAt = summary.indexOf('> comment.md');
-  const postAt = summary.indexOf('      - name: post report');
-  if (seedAt === -1) problems.push('nothing writes a fallback comment.md, so a composer that fails to load leaves the job with nothing to post');
-  if (postAt === -1) problems.push('the `post report` step is gone or renamed - nothing writes the result back');
-  if (seedAt !== -1 && postAt !== -1 && seedAt > postAt) {
+
+  // Structure first, by id. Labels come second - see the REPORT_STEPS comment.
+  for (const want of REPORT_STEPS) {
+    const step = byId.get(want.id);
+    if (!step) {
+      problems.push(`no step with \`id: ${want.id}\` in the report job - the gate finds steps by id, so a missing one means the structure changed, not just a label`);
+      continue;
+    }
+    if (step.name !== want.name) {
+      problems.push(`the step \`id: ${want.id}\` is named ${JSON.stringify(step.name)}, expected ${JSON.stringify(want.name)} - jumpwow's report job uses these exact names, and renaming one here is how the two repos start diverging`);
+    }
+  }
+
+  const seed = byId.get('seed');
+  const fetchStep = byId.get('fetch');
+  const post = byId.get('post');
+
+  if (seed && !seed.text.includes('> comment.md')) {
+    problems.push('the `seed` step does not write comment.md, so a composer that fails to load leaves the job with nothing to post');
+  }
+  if (seed && post && seed.index > post.index) {
     problems.push('the fallback comment.md is written AFTER the post step, which is the same as not writing it at all');
   }
-  if (!/--retry\b/.test(summary)) problems.push('the composer fetch carries no --retry, so a single transient blip silences the report exactly as before');
-  if (!summary.includes('report-degraded.flag')) problems.push('nothing marks a degraded report: a comment carrying only job results must never read like a complete one');
-  if (postAt !== -1) {
-    const end = summary.indexOf('\n      - name:', postAt + 1);
-    const postStep = end === -1 ? summary.slice(postAt) : summary.slice(postAt, end);
-    if (/continue-on-error:\s*true/.test(postStep)) problems.push('the post step is continue-on-error: a monitor allowed to fail quietly is worse than no monitor');
-    if (!/for \(let attempt/.test(postStep)) problems.push('the post step does not retry, and posting is a network call like any other');
-    if (!/readback/.test(postStep)) problems.push('the post step never reads the comment back: an accepted API call is not a comment anybody can read');
+  if (fetchStep && !/--retry\b/.test(fetchStep.text)) {
+    problems.push('the `fetch` step carries no --retry, so a single transient blip silences the report exactly as before');
   }
-  if (problems.length) throw fail(`${problems.length} way(s) the report could go missing again`, problems.join('\n'));
-  return 'report job: no checkout, fallback comment seeded before the post, fetch retried, post retried and read back, degraded reports flagged red';
+  if (!summary.includes('report-degraded.flag')) {
+    problems.push('nothing marks a degraded report: a comment carrying only job results must never read like a complete one');
+  }
+  if (post) {
+    if (/continue-on-error:\s*true/.test(post.text)) problems.push('the post step is continue-on-error: a monitor allowed to fail quietly is worse than no monitor');
+    if (!/for \(let attempt/.test(post.text)) problems.push('the post step does not retry, and posting is a network call like any other');
+    if (!/readback/.test(post.text)) problems.push('the post step never reads the comment back: an accepted API call is not a comment anybody can read');
+  }
+
+  if (problems.length) {
+    const seen = steps.map(s => `${s.id || '(no id)'} — ${s.name === null ? '(no name)' : s.name}`).join('\n');
+    throw fail(`${problems.length} way(s) the report could go missing again`, `${problems.join('\n')}\n---- steps found in the report job ----\n${seen}`);
+  }
+  return `${REPORT_STEPS.length} steps found by id with the expected names; no checkout, fallback seeded before the post, fetch retried, post retried and read back, degraded reports flagged red`;
 });
 
 // An injected classic script cannot import the core, so the element limit exists

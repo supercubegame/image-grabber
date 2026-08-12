@@ -26,6 +26,9 @@ const POLL_INTERVAL_MS = 250;
 // move with them.
 const DOWNLOAD_TIMEOUT_MS = EXPECTED.downloads.gateTimeoutMs;
 const LAUNCH_TIMEOUT_MS = 60000;
+// How long the extension's service worker gets to appear AND finish booting. Two
+// separate waits, because the target shows up well before chrome.* is bound.
+const WORKER_BOOT_TIMEOUT_MS = 30000;
 
 // Auto-scroll option sets. Coupled to the fixture batch maths in expected.js:
 // scroll-finite.html needs 3 scrolls to load its batches plus 3 more to confirm the
@@ -314,17 +317,40 @@ const steps = [
       });
       const target = await ctx.browser.waitForTarget(
         t => t.type() === 'service_worker' && t.url().startsWith('chrome-extension://'),
-        { timeout: 30000 }
+        { timeout: WORKER_BOOT_TIMEOUT_MS }
       );
       ctx.extId = new URL(target.url()).host;
       ctx.worker = await target.worker();
-      const info = await swEval(() => ({
-        name: chrome.runtime.getManifest().name,
-        version: chrome.runtime.getManifest().version,
-        diag: typeof self.__DIAG__
-      }));
-      if (info.diag !== 'object') throw new Error('service worker exposes no __DIAG__ object');
-      return `${info.name} v${info.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}`;
+
+      // The target EXISTS before the worker has finished evaluating. chrome.* is
+      // bound during that startup, so reading chrome.runtime.getManifest() on the
+      // line after waitForTarget is a race - and it lost once in CI, with a bare
+      // "Cannot read properties of undefined (reading 'getManifest')". Being the
+      // first and critical step, it took all 28 checks after it down as blocked,
+      // while nothing in the extension was wrong.
+      //
+      // This was also the only step in this file that read a value and asserted on
+      // it in one shot. Poll until a condition holds; never grab and hope.
+      let boot = null;
+      await waitFor('the service worker to finish booting (chrome.* bound and __DIAG__ published)', async () => {
+        boot = await swEval(() => {
+          const hasChrome = typeof chrome !== 'undefined' && !!chrome.runtime;
+          const manifest = hasChrome ? chrome.runtime.getManifest() : null;
+          return {
+            chrome: typeof chrome === 'undefined' ? 'undefined' : typeof chrome,
+            runtime: typeof chrome === 'undefined' ? 'undefined' : typeof chrome.runtime,
+            name: manifest ? manifest.name : null,
+            version: manifest ? manifest.version : null,
+            diag: typeof self.__DIAG__
+          };
+        });
+        return boot.runtime === 'object' && boot.diag === 'object';
+      }, { timeout: WORKER_BOOT_TIMEOUT_MS, snapshot: () => boot });
+
+      // Kept as its own assertion rather than folded into the poll: a worker that
+      // booted but never published __DIAG__ should read as that, not as a timeout.
+      if (boot.diag !== 'object') throw evidenceError('service worker exposes no __DIAG__ object', boot);
+      return `${boot.name} v${boot.version} loaded as ${ctx.extId}, fixtures on ${ctx.server.origin}`;
     }
   },
   {

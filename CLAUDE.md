@@ -1,9 +1,8 @@
 # Image Grabber — project rules
 
-Chrome MV3 extension. Scans a tab for images - `<img>`, CSS backgrounds, generated
-`::before`/`::after` - filters by size and format, downloads them through
-`chrome.downloads` with retries and progress, optionally auto-scrolling a lazy page
-first. Two triggers: the popup, and two right-click menu items (with/without scroll).
+Chrome MV3 extension. Scans a tab for images (`<img>`, CSS backgrounds, generated
+`::before`/`::after`), filters, downloads them through `chrome.downloads` with retries,
+progress and optional auto-scroll. Two triggers: the popup and two right-click items.
 
 ## Layout
 
@@ -48,16 +47,14 @@ which the comment falls back to when a gate dies before writing a report.
    loop and the waiting live in the worker.
 4. **The collector reports what it saw; the core decides what it means.** `collect.js`
    returns raw `backgroundImage` strings and an element count, never parsed urls:
-   `url()` parsing is `parseCssUrls` in the core, unit tested against real computed
-   styles. The regex it replaced (`[^'")]+`) silently dropped every quoted url with a
-   bracket. A pseudo-element counts only when GENERATED - Chrome answers with a
-   computed style for a `::before` with no `content`, listing images nowhere on the page.
+   `url()` parsing is `parseCssUrls`, unit tested against real computed styles. The
+   regex it replaced (`[^'")]+`) dropped every quoted url with a bracket. A pseudo-
+   element counts only when GENERATED - Chrome answers for a `::before` with no `content`.
 5. **A scan that did not look at the whole page says so.** `SCAN_ELEMENT_LIMIT` (4000)
-   caps the CSS walk. `scanCoverage` turns a partial walk into `complete: false` plus a
-   warning, riding out on the bulk result (`scanComplete` / `scanWarning`), the popup
-   banner and the badge `?` - the same contract as an unconfirmed scroll. A MISSING
-   coverage report also reads as incomplete: "cannot tell" and "saw it all" are not one
-   answer. The cap is on elements, not images - `document.images` is walked whole.
+   caps the CSS walk; `scanCoverage` turns a partial walk into `complete: false` plus a
+   warning, riding out on `scanComplete`/`scanWarning`, the popup banner and the badge
+   `?` - same contract as an unconfirmed scroll. A MISSING coverage report also reads as
+   incomplete. The cap is on elements - `document.images` is always walked whole.
 6. **`?tabId=` is a read-only override** for the gate; the popup defaults to the
    active tab.
 7. **Every download path goes through `planDownloads`.** It filters, numbers and
@@ -99,14 +96,12 @@ which the comment falls back to when a gate dies before writing a report.
   was never confirmed OR the page was too big to inspect whole, `2/3` means a lost file.
 - **Progress is broadcast and nobody may be listening.** With the popup closed it has
   no receiver; the rejection is swallowed on purpose and the badge is the other half.
-- **The two triggers get their download failures from different fixtures.** The menu
-  path uses `downloads.html`, whose third image is served by `/once/` - it works for
-  the page and 500s forever after. Flaky/backoff checks go through the popup's message
-  path: a page whose `<img>` answers 500 logs a console error the gate would trip on.
+- **The two triggers fail from different fixtures.** The menu path uses `downloads.html`
+  (`/once/` serves the page then 500s forever); flaky and backoff checks go through the
+  popup's message path, because an `<img>` that answers 500 logs a console error.
 - **A stalled page is indistinguishable from a finished one, and we do not pretend
-  otherwise.** A loader that dies mid-spinner stops changing, so it reports `settled`
-  with whatever arrived (`scroll-broken.html` asserts that); only `growthRounds` hints
-  at the difference. Any fix guesses at spinner markup - not without a fixture.
+  otherwise.** A dead loader stops changing, so it reports `settled` with whatever
+  arrived (`scroll-broken.html`); only `growthRounds` hints. Any fix guesses at markup.
 - **Auto-scroll is off by default:** it moves the user's page and takes seconds.
 
 ## Coupled parameters — change one, recheck the other
@@ -152,6 +147,7 @@ which the comment falls back to when a gate dies before writing a report.
   A FLOOR, so the count beside it can drift unnoticed - it had, by one. Re-read it.
 - `MAX_RULES_LINES` (200) ↔ this file, and `CLAUDE.md` must stay byte-identical. Both
   are gate conditions; edit one and copy it over the other.
+- `REPORT_STEPS` (verify.js) ↔ the `summary` job's step ids and names. See below.
 
 ## Gate rules
 
@@ -186,14 +182,18 @@ which the comment falls back to when a gate dies before writing a report.
   128) before it could post. That job now clones nothing - it fetches the two scripts
   it needs over the API with `--retry` - and it seeds a fallback `comment.md` from the
   job results BEFORE any step that can fail, so the degraded path is walked every run
-  instead of rotting unused. A degraded comment says so and the job ends red. The fast
-  gate asserts all of it, because this rule already broke once.
+  instead of rotting unused. A degraded comment says so and the job ends red.
+- **The report job is shared with `supercubegame/jumpwow`: same steps, same `id:`s,
+  same Chinese names.** The gate locates those steps BY ID. An assertion keyed on a
+  display label turns "rename a step" into "break the gate", which is how the names
+  ended up English here and Chinese there. Names are asserted separately, so a rename
+  goes red instead of quietly diverging. What NEITHER repo can assert is that the two
+  still match - only a reusable workflow would make them literally one file.
 - **New behaviour ships with a new assertion.** A feature the gate cannot see is one
   the next change can break for free.
 
 ## Things an agent cannot do here
 
 Publishing to the Chrome Web Store, anything needing a signed-in Chrome profile,
-right-clicking a real page to check the menu items read well, running the grabber
-against a real infinite-scroll site or a flaky network, judging whether the UI is
-pleasant. Those are the human's.
+right-clicking a real page to check the menu items read well, running the grabber on a
+real infinite-scroll site or flaky network, judging whether the UI is pleasant.
