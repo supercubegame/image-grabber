@@ -1,11 +1,9 @@
 # Image Grabber — project rules
 
-Chrome MV3 extension. Scans a tab for images - `<img>` tags, CSS backgrounds and the
-backgrounds of generated `::before`/`::after` - filters by size and format, downloads
-them through `chrome.downloads`, retrying transient failures and reporting progress.
-Optionally auto-scrolls a lazy page first so the scan sees everything it will load.
-Two triggers: the popup (pick and choose) and two right-click menu items (whole page
-in one click, with or without scrolling).
+Chrome MV3 extension. Scans a tab for images - `<img>`, CSS backgrounds, generated
+`::before`/`::after` - filters by size and format, downloads them through
+`chrome.downloads` with retries and progress, optionally auto-scrolling a lazy page
+first. Two triggers: the popup, and two right-click menu items (with/without scroll).
 
 ## Layout
 
@@ -50,18 +48,16 @@ which the comment falls back to when a gate dies before writing a report.
    loop and the waiting live in the worker.
 4. **The collector reports what it saw; the core decides what it means.** `collect.js`
    returns raw `backgroundImage` strings and an element count, never parsed urls:
-   `url()` parsing is `parseCssUrls` in the core, unit tested against the shapes a
-   computed style really produces. The regex it replaced (`[^'")]+`) silently dropped
-   every quoted url containing a bracket. A pseudo-element counts only when it is
-   GENERATED - Chrome answers with a computed style for a `::before` with no
-   `content`, and collecting that lists images nowhere on the page.
+   `url()` parsing is `parseCssUrls` in the core, unit tested against real computed
+   styles. The regex it replaced (`[^'")]+`) silently dropped every quoted url with a
+   bracket. A pseudo-element counts only when GENERATED - Chrome answers with a
+   computed style for a `::before` with no `content`, listing images nowhere on the page.
 5. **A scan that did not look at the whole page says so.** `SCAN_ELEMENT_LIMIT` (4000)
-   caps the CSS walk, so a huge page gets inspected in part. `scanCoverage` turns that
-   into `complete: false` plus a warning, and it rides out on the bulk result
-   (`scanComplete` / `scanWarning`), the popup banner and the badge `?` - the same
-   contract as an unconfirmed scroll. A MISSING coverage report also reads as
-   incomplete: "cannot tell" and "saw it all" must never be one answer. The cap is on
-   elements, not images - `document.images` is always walked whole.
+   caps the CSS walk. `scanCoverage` turns a partial walk into `complete: false` plus a
+   warning, riding out on the bulk result (`scanComplete` / `scanWarning`), the popup
+   banner and the badge `?` - the same contract as an unconfirmed scroll. A MISSING
+   coverage report also reads as incomplete: "cannot tell" and "saw it all" are not one
+   answer. The cap is on elements, not images - `document.images` is walked whole.
 6. **`?tabId=` is a read-only override** for the gate; the popup defaults to the
    active tab.
 7. **Every download path goes through `planDownloads`.** It filters, numbers and
@@ -79,9 +75,8 @@ which the comment falls back to when a gate dies before writing a report.
      never read as a clean sweep - that is the whole point of the feature.
    - `maxImages` is the exception: the caller got the N it asked for, so it ends
      through the normal path with `reachedEnd: true` and no warning.
-   - `reachedEnd` is derived once, in `isConfirmedEnd`; two derivations disagree
-     eventually. An unreadable measurement throws - reading it as "unchanged" would
-     settle any run after three failed injections.
+   - `reachedEnd` is derived once, in `isConfirmedEnd`. An unreadable measurement
+     throws - reading it as "unchanged" settles any run after three failed injections.
 10. **A file is downloaded when it is on disk, and every download goes through
     `runDownloads`.** An id from `chrome.downloads.download` means the transfer
     STARTED; the worker waits for the real terminal state. `done + failed + skipped
@@ -92,9 +87,8 @@ which the comment falls back to when a gate dies before writing a report.
       check - same reasoning as an unconfirmed scroll.
     - **An unrecognised interrupt reason is permanent**, reported with its raw code.
       Classify new ones deliberately in `RETRYABLE`/`PERMANENT`.
-    - Retries use `conflictAction: 'overwrite'`; only a first attempt uniquifies. A
-      retry is a second try at a path we chose - uniquifying would pile up
-      `name (1).png` and break the generated-name contract.
+    - Retries use `conflictAction: 'overwrite'`; only a first attempt uniquifies - a
+      retry at a path we chose would otherwise pile up `name (1).png`.
 
 ## Behaviour worth knowing before you change it
 
@@ -166,8 +160,7 @@ which the comment falls back to when a gate dies before writing a report.
 - Poll until a condition holds; never `sleep(n)` and hope. Predicates return booleans.
 - Every failure carries evidence (expected vs actual, or an output tail): if the
   comment alone cannot get you to the root cause, the report is incomplete.
-- Colour and timing thresholds only catch "nothing rendered" and "hung". Keep 3x
-  margin - CI has no GPU and a shared CPU.
+- Colour/timing thresholds only catch "nothing rendered" and "hung"; keep 3x margin.
 - **Prefer a delta over an absolute floor.** A colour floor lived here for a while and
   could never fail: the empty popup already samples ~445 colours of its own chrome.
   Assert the difference between two states - only that part comes from the feature.
@@ -188,6 +181,13 @@ which the comment falls back to when a gate dies before writing a report.
   (`completedCount()`). An `interrupted` entry counts towards `search({}).length` but
   never towards `complete`, so after the first check that leaves a failure behind the
   next is unsatisfiable - and it fails as a TIMEOUT, taking later checks with it.
+- **A report that does not arrive did not run.** Run #51 was both gates green and not
+  one comment anywhere: the report job's `actions/checkout` died on a TLS error (exit
+  128) before it could post. That job now clones nothing - it fetches the two scripts
+  it needs over the API with `--retry` - and it seeds a fallback `comment.md` from the
+  job results BEFORE any step that can fail, so the degraded path is walked every run
+  instead of rotting unused. A degraded comment says so and the job ends red. The fast
+  gate asserts all of it, because this rule already broke once.
 - **New behaviour ships with a new assertion.** A feature the gate cannot see is one
   the next change can break for free.
 

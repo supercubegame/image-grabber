@@ -79,69 +79,191 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: exit 1
 
+  # There is deliberately NO actions/checkout in this job.
+  #
+  # Run #51: both gates green, and not one comment anywhere. git failed TLS
+  # verification and exited 128 in the checkout step, taking the entire write-back
+  # with it. From outside the repo the run looked like it had happened; nobody and
+  # nothing could read a result. This job needs two script files, not a working
+  # tree, so it fetches exactly those two over the API with retries.
+  #
+  # See "A report that does not arrive did not run" in AGENTS.md. The fast gate
+  # asserts the shape of this job, so the rule cannot quietly come undone.
   summary:
     name: report
     if: always()
     needs: [fast, e2e]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
       - name: download reports
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           path: reports
           pattern: report-*
-      - name: compose comment
-        run: node scripts/compose-report.js reports
-      # This step is deliberately NOT continue-on-error. If the write-back breaks,
-      # the run must go red: a monitor that fails silently is worse than none.
+
+      # Seeded before anything that can fail, on EVERY run, so the degraded path is
+      # executed every time instead of being a branch nobody has ever walked. The
+      # composer overwrites comment.md when it loads; the flag file is how the steps
+      # below tell which of the two they are holding.
+      - name: seed a fallback comment
+        shell: bash
+        run: |
+          set -uo pipefail
+          touch report-degraded.flag
+          {
+            echo "⚠️ **report degraded** — the composer never loaded, so this carries the"
+            echo "job-level result only, with no per-check evidence."
+            echo ""
+            echo "| gate | job result |"
+            echo "| --- | --- |"
+            echo "| fast gate | \`${{ needs.fast.result }}\` |"
+            echo "| browser gate | \`${{ needs.e2e.result }}\` |"
+            echo ""
+            echo "commit \`${GITHUB_SHA:0:7}\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          } > comment.md
+          found=0
+          while IFS= read -r log; do
+            found=$((found + 1))
+            {
+              echo ""
+              echo "<details><summary>last 80 lines of $(basename "$log")</summary>"
+              echo ""
+              echo '```'
+              tail -n 80 "$log"
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> comment.md
+          done < <(find reports -name 'stdout-*.log' 2>/dev/null | sort)
+          if [ "$found" -eq 0 ]; then
+            printf '\nNo gate stdout logs were downloaded either, so this broke before the gates produced anything - look at the workflow, not the gates.\n' >> comment.md
+          fi
+
+      # Two files over HTTPS instead of a clone, pinned to the commit under test so
+      # the composer always matches the code it is reporting on. --retry-all-errors
+      # covers the transient network class that took run #51 down.
       #
-      # The comment also goes to the job summary FIRST. A failed write-back used to
-      # take the whole report down with it; now the evidence is at least on the run
-      # page for a human, even when nothing can be posted.
+      # scripts/package.json is written here because without a checkout there is no
+      # root package.json, and node would parse these ESM files as CommonJS.
+      - name: fetch the composer
+        id: fetch
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p scripts/lib
+          echo '{ "type": "module" }' > scripts/package.json
+          for f in scripts/compose-report.js scripts/lib/report.js; do
+            curl --fail --silent --show-error --location \
+                 --retry 5 --retry-delay 3 --retry-all-errors \
+                 --connect-timeout 10 --max-time 60 \
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github.raw" \
+                 -o "$f" \
+                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/$f?ref=$GITHUB_SHA"
+            test -s "$f"
+          done
+
+      - name: compose the report
+        id: compose
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/compose-report.js reports
+          test -s comment.md
+          rm -f report-degraded.flag
+
+      # NOT continue-on-error, and it must never become it: a write-back allowed to
+      # fail quietly is precisely what run #51 looked like from the outside.
       - name: post report
         uses: actions/github-script@v7
         with:
+          retries: 3
           script: |
             const fs = require('fs');
             const marker = '<!-- image-grabber-verify -->';
-            const body = marker + '\n' + fs.readFileSync('comment.md', 'utf8');
+            const degraded = fs.existsSync('report-degraded.flag');
+            const text = fs.readFileSync('comment.md', 'utf8');
+            const body = marker + '\n' + text;
             const { owner, repo } = context.repo;
 
-            await core.summary.addRaw(fs.readFileSync('comment.md', 'utf8')).write();
+            // Job summary first. If every attempt below fails, the evidence is at
+            // least on the run page for a human.
+            await core.summary.addRaw(text).write();
 
-            let prNumber = null;
-            const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner, repo, commit_sha: context.sha
-            });
-            const open = associated.data.find(pr => pr.state === 'open');
-            if (open) prNumber = open.number;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            if (prNumber) {
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner, repo, issue_number: prNumber, per_page: 100
+            async function postOnce() {
+              const associated = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner, repo, commit_sha: context.sha
               });
-              const existing = comments.find(c => c.body && c.body.includes(marker));
-              const result = existing
-                ? await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
-                : await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
-              const readback = await github.rest.issues.getComment({ owner, repo, comment_id: result.data.id });
-              if (!readback.data.body.includes(marker)) throw new Error('comment read-back did not contain the marker');
-              core.info(`report posted to PR #${prNumber} (comment ${result.data.id})`);
-            } else {
+              const open = associated.data.find(pr => pr.state === 'open');
+              if (open) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: open.number, per_page: 100
+                });
+                const existing = comments.find(c => c.body && c.body.includes(marker));
+                const result = existing
+                  ? await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
+                  : await github.rest.issues.createComment({ owner, repo, issue_number: open.number, body });
+                // An accepted API call is not a comment anyone can read; read it back.
+                const readback = await github.rest.issues.getComment({ owner, repo, comment_id: result.data.id });
+                if (!readback.data.body.includes(marker)) throw new Error('read-back of the PR comment did not contain the marker');
+                return `PR #${open.number} (comment ${result.data.id})`;
+              }
+              // The no-PR branch. It is the one that has to work when a push lands on
+              // main, which is exactly when nobody is watching.
               const result = await github.rest.repos.createCommitComment({
                 owner, repo, commit_sha: context.sha, body
               });
               const readback = await github.rest.repos.getCommitComment({ owner, repo, comment_id: result.data.id });
-              if (!readback.data.body.includes(marker)) throw new Error('commit comment read-back did not contain the marker');
-              core.info(`no open PR for this commit; report posted as a commit comment (${result.data.id})`);
+              if (!readback.data.body.includes(marker)) throw new Error('read-back of the commit comment did not contain the marker');
+              return `commit ${context.sha.slice(0, 7)} (comment ${result.data.id})`;
             }
-      - name: fail if any gate failed
-        run: node scripts/compose-report.js reports --check
+
+            let posted = null;
+            let last = null;
+            for (let attempt = 1; attempt <= 4 && !posted; attempt += 1) {
+              try {
+                posted = await postOnce();
+              } catch (err) {
+                last = err;
+                core.warning(`post attempt ${attempt} failed: ${err.message}`);
+                if (attempt < 4) await sleep(2000 * attempt);
+              }
+            }
+            if (!posted) throw new Error(`the report could not be written back after 4 attempts: ${last && last.message}`);
+            core.info(`report posted to ${posted}`);
+            if (degraded) core.setFailed('the report was posted in DEGRADED form: the composer never loaded, so the comment carries job results only');
+
+      # The verdict is computed from the job results, so it survives a composer that
+      # never arrived. --check runs on top of that when the composer IS present.
+      - name: fail if a gate failed or the report was degraded
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          for pair in "fast gate:${{ needs.fast.result }}" "browser gate:${{ needs.e2e.result }}"; do
+            if [ "${pair##*:}" != "success" ]; then echo "${pair%%:*}: ${pair##*:}"; rc=1; fi
+          done
+          if [ -f report-degraded.flag ]; then
+            echo "the composer never loaded; the posted comment has no per-check evidence"
+            rc=1
+          fi
+          if [ -f scripts/compose-report.js ]; then
+            node scripts/compose-report.js reports --check || rc=1
+          fi
+          exit $rc
