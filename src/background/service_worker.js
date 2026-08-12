@@ -1,7 +1,14 @@
 // MV3 service worker: the only place that touches chrome.scripting,
 // chrome.downloads and chrome.contextMenus. No decision logic here - that belongs
 // in src/core/images.js, src/core/scroll.js and src/core/retry.js.
-import { SETTINGS_KEY, mergeSettings, normalizeCandidates, planDownloads } from '../core/images.js';
+import {
+  SETTINGS_KEY,
+  mergeSettings,
+  normalizeCandidates,
+  planDownloads,
+  expandStyleCandidates,
+  scanCoverage
+} from '../core/images.js';
 import { mergeScrollOptions, initScrollRun, observeScroll, scrollSummary } from '../core/scroll.js';
 import { mergeRetryOptions, runDownloads } from '../core/retry.js';
 
@@ -38,6 +45,7 @@ self.__DIAG__ = {
   lastBulk: null,
   scrollRuns: 0,
   lastScroll: null,
+  lastCoverage: null,
   downloadRuns: 0,
   lastDownloadRun: null,
   // Every progress payload the worker published, in order. This is what lets the
@@ -138,8 +146,15 @@ async function scan(tabId, scrollOptions) {
   const results = await chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
   const payload = results && results[0] ? results[0].result : null;
   if (!payload || !Array.isArray(payload.candidates)) throw new Error('content script returned no candidates');
+  // The collector hands back raw computed `background-image` strings; turning them
+  // into candidates is a pure-core decision so that it can be unit tested.
+  payload.candidates = payload.candidates.concat(expandStyleCandidates(payload.styles));
+  // And it reports how much of the page it managed to look at. A page too big for
+  // the element walk must not come back looking like a complete scan.
+  payload.coverage = scanCoverage(payload.coverage);
   payload.scroll = scroll;
   self.__DIAG__.scans += 1;
+  self.__DIAG__.lastCoverage = payload.coverage;
   return payload;
 }
 
@@ -264,6 +279,7 @@ async function bulkDownload(tabId, scrollOverride) {
   const items = normalizeCandidates(payload.candidates, payload.pageUrl);
   const plan = planDownloads(items, settings);
   const scroll = payload.scroll;
+  const coverage = payload.coverage;
   const result = {
     pageUrl: payload.pageUrl,
     found: items.length,
@@ -275,6 +291,11 @@ async function bulkDownload(tabId, scrollOverride) {
     // along with the result and shows up on the badge.
     endConfirmed: scroll ? scroll.reachedEnd : null,
     warning: scroll ? scroll.warning : null,
+    // The same rule one layer earlier: a page with more elements than the collector
+    // walks was only partly INSPECTED, whatever the scroll did.
+    coverage,
+    scanComplete: coverage.complete,
+    scanWarning: coverage.warning,
     ids: [],
     // Download outcomes are namespaced: `skipped` above already means "filtered out
     // before we ever tried", and one word cannot mean two things in one report.
@@ -299,7 +320,11 @@ async function bulkDownload(tabId, scrollOverride) {
   }
   self.__DIAG__.bulkRuns += 1;
   self.__DIAG__.lastBulk = result;
-  await setBadge(result.downloaded, result.endConfirmed === false, result.failed, plan.length);
+  // Either kind of "we did not see all of it" earns the same `?`: to a menu user
+  // the difference between an unconfirmed bottom and an uninspected DOM is nothing,
+  // and both mean the same thing - this was not a clean sweep.
+  const uncertain = result.endConfirmed === false || result.scanComplete === false;
+  await setBadge(result.downloaded, uncertain, result.failed, plan.length);
   return result;
 }
 
@@ -319,8 +344,8 @@ function setProgressBadge(progress) {
 
 // The menu is silent by nature - without this the user cannot tell whether the
 // click did anything at all. The trailing "?" is the only place an unconfirmed
-// scroll is visible to someone who used the menu instead of the popup, and a
-// "2/3" is the only place a failed download is.
+// scroll or a truncated scan is visible to someone who used the menu instead of
+// the popup, and a "2/3" is the only place a failed download is.
 async function setBadge(done, uncertain, failed = 0, total = done) {
   if (!chrome.action || !chrome.action.setBadgeText) return;
   try {

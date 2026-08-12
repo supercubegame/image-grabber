@@ -32,6 +32,45 @@ export const EXPECTED = {
   // Add or remove a fixture thumbnail and this moves with defaultVisible.
   minColorDelta: 400,
 
+  // --- css backgrounds ---------------------------------------------------------
+  // backgrounds.html: 1 <img> plus 6 collectable css urls. The 7th css reference on
+  // that page sits on a ::before that is never generated, and it must NOT appear.
+  backgrounds: {
+    imgElements: 1,
+    uniqueImages: 7,
+    // Neither of these is visible to getComputedStyle(element) - the whole point.
+    pseudoBefore: '/img/220x170.png',
+    pseudoAfter: '/img/230x180.png',
+    // A quoted url whose filename carries brackets. The regex that used to do this
+    // parsing stopped at the first ")" and dropped the image without a sound.
+    parens: '/img/250x200(2).png',
+    // One declaration, two layers: one value has to yield two candidates.
+    layered: ['/img/260x210.png', '/img/270x220.png'],
+    // The negative twin. `.ghost::before` names this image but has no `content`, so
+    // the box is never generated and the image is nowhere on screen - while Chrome
+    // still answers getComputedStyle for it. "We found the ::before backgrounds"
+    // passes for a collector that scoops up every computed style; only this one
+    // fails for it.
+    ghost: '/img/240x190.png',
+    // A pseudo-element background has no intrinsic size either, so it has to make
+    // it all the way through the popup's probe like any other background.
+    probed: { path: '/img/220x170.png', width: 220, height: 170 }
+  },
+
+  // --- scan coverage -----------------------------------------------------------
+  // many-elements.html. FILLER_COUNT in that file must stay above
+  // SCAN_ELEMENT_LIMIT (4000) or the page is inspected in full and the truncation
+  // check quietly passes against a complete scan; the fast gate compares them.
+  coverage: {
+    fillerCount: 4200,
+    // What survives the cap: the background BEFORE the filler, and the <img> after
+    // it - document.images is never truncated, only the element walk is.
+    uniqueImages: 2,
+    early: '/img/280x230.png',
+    late: '/img/290x240.png',
+    lateImg: '/img/300x250.png'
+  },
+
   // --- auto-scroll -------------------------------------------------------------
   // Coupled to scroll-finite.html / scroll-endless.html / scroll-broken.html AND to
   // the option sets at the top of scripts/verify-e2e.js. Three things move together

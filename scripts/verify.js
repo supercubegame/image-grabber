@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Report } from './lib/report.js';
 import { encodePng, decodePng, countDistinctColors } from './lib/png.js';
-import { planDownloads, DOWNLOAD_FOLDER } from '../src/core/images.js';
+import { planDownloads, DOWNLOAD_FOLDER, SCAN_ELEMENT_LIMIT } from '../src/core/images.js';
 import { SCROLL_OUTCOME, initScrollRun, observeScroll, scrollSummary } from '../src/core/scroll.js';
 import {
   MAX_SAFE_BACKOFF_MS,
@@ -25,10 +25,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ARTIFACTS = path.join(ROOT, 'test', 'artifacts');
 const UNIT_DIR = path.join(ROOT, 'test', 'unit');
 // Guards against the classic false green: a runner that finds nothing still exits 0.
-// Today: 48 tests across 7 files. Keep a little slack, not a lot - the point is to
+// Today: 64 tests across 8 files. Keep a little slack, not a lot - the point is to
 // notice when a file stops being discovered.
-const MIN_UNIT_FILES = 7;
-const MIN_UNIT_TESTS = 42;
+const MIN_UNIT_FILES = 8;
+const MIN_UNIT_TESTS = 56;
 // AGENTS.md says to keep itself under 200 lines, because past that the model it is
 // written for starts skimming. It had drifted to 220 before anything checked.
 const MAX_RULES_LINES = 200;
@@ -130,6 +130,35 @@ report.check('the rules files stay short and the two copies stay identical', () 
     throw fail(`CLAUDE.md is not a copy of AGENTS.md - they diverge at line ${at + 1}`, `AGENTS.md: ${a[at]}\nCLAUDE.md: ${c[at] === undefined ? '(file ends here)' : c[at]}`);
   }
   return `${lines} lines (limit ${MAX_RULES_LINES}), CLAUDE.md identical`;
+});
+
+// An injected classic script cannot import the core, so the element limit exists
+// twice on purpose. A drift between the copies is invisible from the outside: the
+// scan keeps working and only the truncation REPORT starts lying - which is the one
+// thing that feature exists to get right. The fixture belongs in the same check,
+// because a fixture that no longer exceeds the limit turns the browser gate's
+// truncation step into a check that passes against a perfectly complete scan.
+report.check('the element limit is one number everywhere that depends on it', () => {
+  const collectSrc = read('src/content/collect.js');
+  const fixtureSrc = read('test/fixtures/many-elements.html');
+  const inCollector = /const\s+MAX_ELEMENTS\s*=\s*(\d+)/.exec(collectSrc);
+  if (!inCollector) throw fail('MAX_ELEMENTS is not declared in src/content/collect.js - renamed, or the walk lost its cap?', tail(collectSrc, 30));
+  const inFixture = /const\s+FILLER_COUNT\s*=\s*(\d+)/.exec(fixtureSrc);
+  if (!inFixture) throw fail('FILLER_COUNT is not declared in test/fixtures/many-elements.html - the truncation fixture cannot be verified', tail(fixtureSrc, 30));
+  const collector = Number(inCollector[1]);
+  const filler = Number(inFixture[1]);
+  const problems = [];
+  if (collector !== SCAN_ELEMENT_LIMIT) {
+    problems.push(`collect.js walks ${collector} elements, the core reports the limit as ${SCAN_ELEMENT_LIMIT} - every coverage number would be computed against the wrong cap`);
+  }
+  if (filler <= SCAN_ELEMENT_LIMIT) {
+    problems.push(`many-elements.html builds ${filler} filler elements against a ${SCAN_ELEMENT_LIMIT} limit: the page would be inspected in FULL, and the truncation step would pass without ever truncating anything`);
+  }
+  if (EXPECTED.coverage.fillerCount !== filler) {
+    problems.push(`EXPECTED.coverage.fillerCount is ${EXPECTED.coverage.fillerCount} but the fixture builds ${filler}`);
+  }
+  if (problems.length) throw fail(`${problems.length} element-limit mismatch(es)`, problems.join('\n'));
+  return `${SCAN_ELEMENT_LIMIT} in both the core and the collector; the fixture builds ${filler}, ${filler - SCAN_ELEMENT_LIMIT} past the cap`;
 });
 
 // Both download triggers - the popup button and the page context menu - build
