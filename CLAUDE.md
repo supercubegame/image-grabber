@@ -147,7 +147,7 @@ which the comment falls back to when a gate dies before writing a report.
   A FLOOR, so the count beside it can drift unnoticed - it had, by one. Re-read it.
 - `MAX_RULES_LINES` (200) ↔ this file, and `CLAUDE.md` must stay byte-identical. Both
   are gate conditions; edit one and copy it over the other.
-- `REPORT_STEPS` (verify.js) ↔ the `summary` job's step ids and names. See below.
+- `SHARED_REPORT_WORKFLOW` (verify.js) ↔ the `summary` job's `uses:` line. See below.
 
 ## Gate rules
 
@@ -183,12 +183,12 @@ which the comment falls back to when a gate dies before writing a report.
   it needs over the API with `--retry` - and it seeds a fallback `comment.md` from the
   job results BEFORE any step that can fail, so the degraded path is walked every run
   instead of rotting unused. A degraded comment says so and the job ends red.
-- **The report job is shared with `supercubegame/jumpwow`: same steps, same `id:`s,
-  same Chinese names.** The gate locates those steps BY ID. An assertion keyed on a
-  display label turns "rename a step" into "break the gate", which is how the names
-  ended up English here and Chinese there. Names are asserted separately, so a rename
-  goes red instead of quietly diverging. What NEITHER repo can assert is that the two
-  still match - only a reusable workflow would make them literally one file.
+- **The report job is not in this repo.** It is one file in
+  `supercubegame/ci-workflows`, pinned `@main`, and jumpwow calls the same one. Two
+  byte-identical copies had nothing guarding them: a gate only sees its own workflow,
+  so editing both stays green while they diverge. This gate asserts the `uses:` line,
+  that no local `steps:` grew back, and that `gates:` reads real `needs.*.result` - a
+  literal there makes the verdict unfalsifiable. A pinned SHA would be drift again.
 - **New behaviour ships with a new assertion.** A feature the gate cannot see is one
   the next change can break for free.
 
